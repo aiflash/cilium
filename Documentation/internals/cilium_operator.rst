@@ -96,7 +96,7 @@ external KVStore configured for the Cilium Operator if running with
 ``--synchronize-k8s-services`` flag.
 
 The Cilium Operator performs this operation only for shared services (services
-that have ``io.cilium/shared-service`` annotation set to true). This is
+that have ``service.cilium.io/shared`` annotation set to true). This is
 meaningful when running Cilium to setup a ClusterMesh.
 
 K8s Nodes synchronization
@@ -189,7 +189,7 @@ KVStore Identity garbage collection
 While the CRD allocation mode for identities is more common, it is
 limited in terms of scale. When running in a very large environment, a
 saner choice is to use the KVStore allocation mode. This mode stores
-the identities in an external store like etcd or Consul.
+the identities in an external store like etcd.
 
 For more information on Cilium's scalability visit :ref:`scalability_guide`.
 

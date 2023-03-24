@@ -1,5 +1,5 @@
-# Copyright 2017-2020 Authors of Cilium
-# SPDX-License-Identifier: Apache-2.0
+# Copyright Authors of Cilium
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 
 include ../../Makefile.defs
 
@@ -11,8 +11,6 @@ include ../Makefile.bpf
 
 SOCKOPS_OPTIONS = \
 	 -DSKIP_DEBUG \
-	 -DHAVE_LPM_TRIE_MAP_TYPE \
-	 -DHAVE_LRU_HASH_MAP_TYPE \
 	 -DENABLE_IPV4 \
 	 -DENABLE_IPV6 \
 	 -DENCAP_IFINDEX=1

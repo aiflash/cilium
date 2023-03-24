@@ -1,25 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package regeneration
 
 import (
 	"context"
 
-	"github.com/cilium/cilium/pkg/datapath"
+	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/lock"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
-	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 )
 
 // Owner is the interface defines the requirements for anybody owning policies.
 type Owner interface {
-	// Must return the policy repository
-	GetPolicyRepository() *policy.Repository
-
 	// QueueEndpointBuild puts the given endpoint in the processing queue
 	QueueEndpointBuild(ctx context.Context, epID uint64) (func(), error)
 
@@ -54,11 +50,9 @@ type EndpointInfoSource interface {
 	GetIPv6Address() string
 	GetIdentity() identity.NumericIdentity
 	GetLabels() []string
-	GetLabelsSHA() string
 	HasSidecarProxy() bool
 	ConntrackName() string
 	ConntrackNameLocked() string
-	GetProxyInfoByFields() (uint64, string, string, []string, string, uint64, error)
 }
 
 // EndpointUpdater returns information about an endpoint being proxied and

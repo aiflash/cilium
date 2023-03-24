@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package eppolicymap
 
@@ -19,7 +19,7 @@ import (
 var (
 	log          = logging.DefaultLogger.WithField(logfields.LogSubsys, "map-ep-policy")
 	MapName      = "cilium_ep_to_policy"
-	innerMapName = "ep-policy-inner-map"
+	innerMapName = "ep_policy_inner_map"
 )
 
 const (
@@ -72,7 +72,9 @@ func CreateWithName(mapName string) error {
 			0,
 			0,
 			bpf.ConvertKeyValue,
-		).WithCache()
+		).WithCache().
+			WithEvents(option.Config.GetEventBufferConfig(mapName))
+
 		EpPolicyMap.InnerID = uint32(fd)
 	})
 

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2017-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package cmd
 
@@ -10,14 +10,14 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"github.com/cilium/cilium/api/v1/client/daemon"
 	"github.com/cilium/cilium/api/v1/models"
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/maps/ctmap"
-
-	"github.com/spf13/cobra"
 )
 
 // bpfCtListCmd represents the bpf_ct_list command
@@ -48,7 +48,7 @@ func init() {
 	bpfCtListCmd.Flags().StringVar(&timeDiffClockSourceMode, "time-diff-clocksource-mode", "", "manually set clock source mode (instead of contacting the server)")
 	bpfCtListCmd.Flags().Int64Var(&timeDiffClockSourceHz, "time-diff-clocksource-hz", 250, "manually set clock source Hz")
 	bpfCtCmd.AddCommand(bpfCtListCmd)
-	command.AddJSONOutput(bpfCtListCmd)
+	command.AddOutputOption(bpfCtListCmd)
 }
 
 func getMaps(eID string) []*ctmap.Map {
@@ -140,9 +140,9 @@ func dumpCt(maps []interface{}, args ...interface{}) {
 			Fatalf("Unable to open %s: %s", path, err)
 		}
 		defer m.(ctmap.CtMap).Close()
-		// Plain output prints immediately, JSON output holds until it
+		// Plain output prints immediately, JSON/YAML output holds until it
 		// collected values from all maps to have one consistent object
-		if command.OutputJSON() {
+		if command.OutputOption() {
 			callback := func(key bpf.MapKey, value bpf.MapValue) {
 				record := ctmap.CtMapRecord{Key: key.(ctmap.CtKey), Value: *value.(*ctmap.CtEntry)}
 				entries = append(entries, record)
@@ -154,7 +154,7 @@ func dumpCt(maps []interface{}, args ...interface{}) {
 			doDumpEntries(m.(ctmap.CtMap))
 		}
 	}
-	if command.OutputJSON() {
+	if command.OutputOption() {
 		if err := command.PrintOutput(entries); err != nil {
 			os.Exit(1)
 		}

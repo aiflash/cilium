@@ -24,16 +24,26 @@ esac
 
 ENABLE_DEBUG=false
 CNI_EXCLUSIVE=true
+LOG_FILE="/var/run/cilium/cilium-cni.log"
+
 while test $# -gt 0; do
   case "$1" in
     --enable-debug*)
       # shellcheck disable=SC2001
+      # the below sed is to support both formats "--flag value" and "--flag=value"
       ENABLE_DEBUG=$(echo "$1" | sed -e 's/^[^=]*=//g')
       shift
       ;;
     --cni-exclusive*)
       # shellcheck disable=SC2001
+      # the below sed is to support both formats "--flag value" and "--flag=value"
       CNI_EXCLUSIVE=$(echo "$1" | sed -e 's/^[^=]*=//g')
+      shift
+      ;;
+    --log-file*)
+      # shellcheck disable=SC2001
+      # the below sed is to support both formats "--flag value" and "--flag=value"
+      LOG_FILE=$(echo "$1" | sed -e 's/^[^=]*=//g')
       shift
       ;;
     *)
@@ -42,34 +52,9 @@ while test $# -gt 0; do
   esac
 done
 
-BIN_NAME=cilium-cni
-CNI_DIR=${CNI_DIR:-${HOST_PREFIX}/opt/cni}
 CILIUM_CNI_CONF=${CILIUM_CNI_CONF:-${HOST_PREFIX}/etc/cni/net.d/${CNI_CONF_NAME}}
 CNI_CONF_DIR="$(dirname "$CILIUM_CNI_CONF")"
 CILIUM_CUSTOM_CNI_CONF=${CILIUM_CUSTOM_CNI_CONF:-false}
-
-if [ ! -d "${CNI_DIR}/bin" ]; then
-	mkdir -p "${CNI_DIR}/bin"
-fi
-
-# Install the CNI loopback driver if not installed already
-if [ ! -f "${CNI_DIR}/bin/loopback" ]; then
-	echo "Installing loopback driver..."
-
-	# Don't fail hard if this fails as it is usually not required
-	cp /cni/loopback "${CNI_DIR}/bin/" || true
-fi
-
-echo "Installing ${BIN_NAME} to ${CNI_DIR}/bin/ ..."
-
-# Move an eventual old existing binary out of the way, we can't delete it
-# as it might be in use right now.
-if [ -f "${CNI_DIR}/bin/${BIN_NAME}" ]; then
-	rm -f "${CNI_DIR}/bin/${BIN_NAME}.old" || true
-	mv "${CNI_DIR}/bin/${BIN_NAME}" "${CNI_DIR}/bin/${BIN_NAME}.old"
-fi
-
-cp "/opt/cni/bin/${BIN_NAME}" "${CNI_DIR}/bin/"
 
 # The CILIUM_CUSTOM_CNI_CONF env is set by the `cni.customConf` Helm option.
 # It stops this script from touching the host's CNI config directory.
@@ -92,6 +77,34 @@ find "${CNI_CONF_DIR}" -maxdepth 1 -type f \
   \) \
   -not -name "${CNI_CONF_NAME}" \
   -delete
+
+# Check that a CNI configuration already exists in certain chaining modes.
+# Exit if it does not - provoking a restart later on. This is required to
+# wait until the main CNI has been initialized, e.g. by another pod.
+# *.cilium_bak files are also accepted in case this script already ran on
+# the host.
+case "$CILIUM_CNI_CHAINING_MODE" in
+"aws-cni")
+  tries=30
+  while [[ $tries -gt 0 ]]; do
+  if test -n "$(find "${CNI_CONF_DIR}" -maxdepth 1 -type f -name '*.conf' -or -name '*.conflist' -or -name '*.cilium_bak' )"; then
+      echo "Found existing CNI config for chaining"
+      break
+    else
+      echo "Could not find existing AWS VPC CNI config for chaining, will retry..."
+      tries=$((tries-1))
+      sleep 5
+    fi
+  done
+  if [[ $tries -eq 0 ]]; then
+    echo "Existing CNI config is required for chaining but does not exist yet, exiting..."
+    exit 1
+  fi
+  ;;
+*)
+  echo "Existing CNI config is not required"
+  ;;
+esac
 
 # Rename all remaining CNI configurations to *.cilium_bak. This ensures only
 # Cilium's CNI plugin will remain active. This makes sure Pods are not
@@ -134,7 +147,8 @@ case "$CILIUM_CNI_CHAINING_MODE" in
     {
        "name": "cilium",
        "type": "cilium-cni",
-       "enable-debug": ${ENABLE_DEBUG}
+       "enable-debug": ${ENABLE_DEBUG},
+       "log-file": "${LOG_FILE}"
     }
   ]
 }
@@ -150,7 +164,8 @@ EOF
     {
        "name": "cilium",
        "type": "cilium-cni",
-       "enable-debug": ${ENABLE_DEBUG}
+       "enable-debug": ${ENABLE_DEBUG},
+       "log-file": "${LOG_FILE}"
     },
     {
       "type": "portmap",
@@ -162,7 +177,12 @@ EOF
 	;;
 
 "aws-cni")
-	cat > "${CNI_CONF_NAME}" <<EOF
+  if [ -f "${CNI_CONF_DIR}/10-aws.conflist.cilium_bak" ]; then
+    jq --argjson 'ENABLE_DEBUG' "$ENABLE_DEBUG" --arg 'LOG_FILE' "$LOG_FILE" \
+          '.plugins += [{"name": "cilium", "type": "cilium-cni", "enable-debug": $ENABLE_DEBUG, "log-file": $LOG_FILE}]' \
+          "${CNI_CONF_DIR}/10-aws.conflist.cilium_bak" > "${CNI_CONF_NAME}"
+  else
+    cat > "${CNI_CONF_NAME}" <<EOF
 {
   "cniVersion": "0.3.1",
   "name": "aws-cni",
@@ -183,12 +203,14 @@ EOF
     {
        "name": "cilium",
        "type": "cilium-cni",
-       "enable-debug": ${ENABLE_DEBUG}
+       "enable-debug": ${ENABLE_DEBUG},
+       "log-file": "${LOG_FILE}"
     }
   ]
 }
 EOF
-	;;
+  fi
+  ;;
 
 *)
 	cat > "${CNI_CONF_NAME}" <<EOF
@@ -196,7 +218,8 @@ EOF
   "cniVersion": "0.3.1",
   "name": "cilium",
   "type": "cilium-cni",
-  "enable-debug": ${ENABLE_DEBUG}
+  "enable-debug": ${ENABLE_DEBUG},
+  "log-file": "${LOG_FILE}"
 }
 EOF
 	;;

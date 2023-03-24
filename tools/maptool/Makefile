@@ -1,4 +1,4 @@
-# Copyright 2017-2020 Authors of Cilium
+# Copyright Authors of Cilium
 # SPDX-License-Identifier: Apache-2.0
 
 include ../../Makefile.defs
@@ -11,11 +11,7 @@ all: $(TARGET)
 
 $(TARGET):
 	@$(ECHO_GO)
-ifneq ($(RACE),"")
-	$(QUIET)$(GO_BUILD_WITH_CGO) -o $@
-else
 	$(QUIET)$(GO_BUILD) -o $@
-endif
 
 clean:
 	@$(ECHO_CLEAN)

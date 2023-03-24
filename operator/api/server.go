@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package api
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"syscall"
+
+	"github.com/go-openapi/loads"
+	"github.com/go-openapi/runtime"
+	"golang.org/x/sys/unix"
 
 	operatorApi "github.com/cilium/cilium/api/v1/operator/server"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/operator"
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/go-openapi/loads"
-	"github.com/go-openapi/runtime"
-	"golang.org/x/sys/unix"
 )
 
 var (
@@ -171,7 +173,9 @@ func (s *Server) StartServer() error {
 	return nil
 }
 
-// setsockoptReuseAddrAndPort sets SO_REUSEADDR and SO_REUSEPORT
+// setsockoptReuseAddrAndPort sets the SO_REUSEADDR and SO_REUSEPORT socket options on c's
+// underlying socket in order to improve the chance to re-bind to the same address and port
+// upon restart.
 func setsockoptReuseAddrAndPort(network, address string, c syscall.RawConn) error {
 	var soerr error
 	if err := c.Control(func(su uintptr) {
@@ -179,13 +183,15 @@ func setsockoptReuseAddrAndPort(network, address string, c syscall.RawConn) erro
 		// Allow reuse of recently-used addresses. This socket option is
 		// set by default on listeners in Go's net package, see
 		// net setDefaultListenerSockopts
-		soerr = unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-		if soerr != nil {
+		if err := unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			soerr = fmt.Errorf("failed to setsockopt(SO_REUSEADDR): %w", err)
 			return
 		}
-		// Allow reuse of recently-used ports. This gives the operator a
-		// better change to re-bind upon restarts.
-		soerr = unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+		// Allow reuse of recently-used ports. This gives the agent a
+		// better chance to re-bind upon restarts.
+		if err := unix.SetsockoptInt(s, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+			soerr = fmt.Errorf("failed to Setsockopt(SO_REUSEPORT): %w", err)
+		}
 	}); err != nil {
 		return err
 	}

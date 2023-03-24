@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package nat
 
@@ -92,6 +92,7 @@ func NewMap(name string, v4 bool, entries int) *Map {
 		mapValue = &NatEntry6{}
 		sizeVal = SizeofNatEntry6
 	}
+
 	return &Map{
 		Map: *bpf.NewMap(
 			name,
@@ -103,7 +104,7 @@ func NewMap(name string, v4 bool, entries int) *Map {
 			entries,
 			0, 0,
 			bpf.ConvertKeyValue,
-		).WithCache(),
+		).WithCache().WithEvents(option.Config.GetEventBufferConfig(name)),
 		v4: v4,
 	}
 }

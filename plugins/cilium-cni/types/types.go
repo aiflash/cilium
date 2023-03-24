@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2016-2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package types
 
@@ -9,14 +9,14 @@ import (
 	"net"
 	"os"
 
+	cniTypes "github.com/containernetworking/cni/pkg/types"
+	current "github.com/containernetworking/cni/pkg/types/100"
+	"github.com/containernetworking/cni/pkg/version"
+
 	alibabaCloudTypes "github.com/cilium/cilium/pkg/alibabacloud/eni/types"
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	azureTypes "github.com/cilium/cilium/pkg/azure/types"
 	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
-
-	cniTypes "github.com/containernetworking/cni/pkg/types"
-	current "github.com/containernetworking/cni/pkg/types/040"
-	"github.com/containernetworking/cni/pkg/version"
 )
 
 // NetConf is the Cilium specific CNI network configuration
@@ -26,10 +26,17 @@ type NetConf struct {
 	Args         Args                   `json:"args"`
 	ENI          eniTypes.ENISpec       `json:"eni,omitempty"`
 	Azure        azureTypes.AzureSpec   `json:"azure,omitempty"`
-	IPAM         ipamTypes.IPAMSpec     `json:"ipam,omitempty"`
+	IPAM         IPAM                   `json:"ipam,omitempty"` // Shadows the JSON field "ipam" in cniTypes.NetConf.
 	AlibabaCloud alibabaCloudTypes.Spec `json:"alibaba-cloud,omitempty"`
 	EnableDebug  bool                   `json:"enable-debug"`
 	LogFormat    string                 `json:"log-format"`
+	LogFile      string                 `json:"log-file"`
+}
+
+// IPAM is the Cilium specific CNI IPAM configuration
+type IPAM struct {
+	cniTypes.IPAM
+	ipamTypes.IPAMSpec
 }
 
 // NetConfList is a CNI chaining configuration
@@ -98,22 +105,11 @@ type ArgsSpec struct {
 
 // Args contains arbitrary information a scheduler
 // can pass to the cni plugin
-type Args struct {
-	Mesos Mesos `json:"org.apache.mesos,omitempty"`
-}
+type Args struct{}
 
-// Mesos contains network-specific information from the scheduler to the cni plugin
-type Mesos struct {
-	NetworkInfo NetworkInfo `json:"network_info"`
-}
-
-// NetworkInfo supports passing only labels from mesos
-type NetworkInfo struct {
-	Name   string `json:"name"`
-	Labels struct {
-		Labels []struct {
-			Key   string `json:"key"`
-			Value string `json:"value"`
-		} `json:"labels,omitempty"`
-	} `json:"labels,omitempty"`
-}
+// CNI error codes
+// (error codes 100+ are allowed for plugin use)
+const (
+	CniErrHealthzGet uint = 100
+	CniErrUnhealthy       = iota
+)

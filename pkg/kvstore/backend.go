@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2017-2019 Authors of Cilium
+// Copyright Authors of Cilium
 
 package kvstore
 
@@ -34,6 +34,9 @@ type ExtraOptions struct {
 
 	// NoLockQuorumCheck disables the lock acquisition quorum check
 	NoLockQuorumCheck bool
+
+	// ClusterName is the name of each etcd cluster
+	ClusterName string
 }
 
 // StatusCheckInterval returns the interval of status checks depending on the
@@ -193,7 +196,7 @@ type BackendOperations interface {
 	Watch(ctx context.Context, w *Watcher)
 
 	// Close closes the kvstore client
-	Close()
+	Close(ctx context.Context)
 
 	// GetCapabilities returns the capabilities of the backend
 	GetCapabilities() Capabilities

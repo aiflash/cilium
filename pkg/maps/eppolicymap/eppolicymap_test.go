@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018-2019 Authors of Cilium
-
-//go:build privileged_tests
-// +build privileged_tests
+// Copyright Authors of Cilium
 
 package eppolicymap
 
@@ -13,12 +10,15 @@ import (
 	"testing"
 	"unsafe"
 
+	. "gopkg.in/check.v1"
+
+	"github.com/cilium/ebpf/rlimit"
+
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/maps/lxcmap"
 	"github.com/cilium/cilium/pkg/maps/policymap"
 	"github.com/cilium/cilium/pkg/option"
-
-	. "gopkg.in/check.v1"
+	"github.com/cilium/cilium/pkg/testutils"
 )
 
 // Hook up gocheck into the "go test" runner.
@@ -31,9 +31,11 @@ type EPPolicyMapTestSuite struct{}
 var _ = Suite(&EPPolicyMapTestSuite{})
 
 func (e *EPPolicyMapTestSuite) SetUpTest(c *C) {
+	testutils.PrivilegedCheck(c)
+
 	MapName = "unit_test_ep_to_policy"
 	innerMapName = "unit_test_ep_policy_inner_map"
-	err := bpf.ConfigureResourceLimits()
+	err := rlimit.RemoveMemlock()
 	c.Assert(err, IsNil)
 }
 
@@ -55,7 +57,7 @@ func (e *EPPolicyMapTestSuite) TestWriteEndpoint(c *C) {
 	fd, err := bpf.CreateMap(bpf.MapTypeHash,
 		uint32(unsafe.Sizeof(policymap.PolicyKey{})),
 		uint32(unsafe.Sizeof(policymap.PolicyEntry{})), 1024, 0, 0,
-		"ep-policy-inner-map")
+		innerMapName)
 	c.Assert(err, IsNil)
 
 	keys[0] = lxcmap.NewEndpointKey(net.ParseIP("1.2.3.4"))
@@ -81,7 +83,7 @@ func (e *EPPolicyMapTestSuite) TestWriteEndpointFails(c *C) {
 	_, err := bpf.CreateMap(bpf.MapTypeHash,
 		uint32(unsafe.Sizeof(policymap.PolicyKey{})),
 		uint32(unsafe.Sizeof(policymap.PolicyEntry{})), 1024, 0, 0,
-		"ep-policy-inner-map")
+		innerMapName)
 	c.Assert(err, IsNil)
 
 	keys[0] = lxcmap.NewEndpointKey(net.ParseIP("1.2.3.4"))
@@ -97,7 +99,7 @@ func (e *EPPolicyMapTestSuite) TestWriteEndpointDisabled(c *C) {
 	fd, err := bpf.CreateMap(bpf.MapTypeHash,
 		uint32(unsafe.Sizeof(policymap.PolicyKey{})),
 		uint32(unsafe.Sizeof(policymap.PolicyEntry{})), 1024, 0, 0,
-		"ep-policy-inner-map")
+		innerMapName)
 	c.Assert(err, IsNil)
 
 	keys[0] = lxcmap.NewEndpointKey(net.ParseIP("1.2.3.4"))

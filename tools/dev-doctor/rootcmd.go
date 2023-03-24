@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020-2021 Authors of Cilium
+// Copyright Authors of Cilium
 
 package main
 
@@ -26,8 +26,8 @@ var (
 
 func init() {
 	flags := rootCmd.Flags()
-	backportingChecks = flags.Bool("backporting", false, "run backporting checks")
-	nfsFirewallChecks = flags.Bool("nfs-firewall", false, "run extra NFS firewall checks, requires root privileges")
+	backportingChecks = flags.Bool("backporting", false, "Run backporting checks")
+	nfsFirewallChecks = flags.Bool("nfs-firewall", false, "Run extra NFS firewall checks, requires root privileges")
 }
 
 func rootCmdRun(cmd *cobra.Command, args []string) {
@@ -56,6 +56,13 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			minVersion:    &minGoVersion,
 		},
 		&binaryCheck{
+			name:          "tparse",
+			ifNotFound:    checkWarning,
+			versionArgs:   []string{"-v"},
+			versionRegexp: regexp.MustCompile(`tparse version: v(\d+\.\d+\.\d+)`),
+			hint:          `Run "go install github.com/mfridman/tparse@latest"`,
+		},
+		&binaryCheck{
 			name:          "clang",
 			ifNotFound:    checkError,
 			versionArgs:   []string{"--version"},
@@ -81,17 +88,17 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			command:       "docker",
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"buildx", "version"},
-			versionRegexp: regexp.MustCompile(`github\.com/docker/buildx v(\d+\.\d+\.\d+)`),
-			hint:          "see https://docs.docker.com/engine/install/",
+			versionRegexp: regexp.MustCompile(`github\.com/docker/buildx v?(\d+\.\d+\.\d+)`),
+			hint:          "see https://docs.docker.com/buildx/working-with-buildx/",
 		},
-		// FIXME add libelf-devel check?
 		&binaryCheck{
 			name:          "ginkgo",
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"version"},
 			versionRegexp: regexp.MustCompile(`Ginkgo Version (\d+\.\d+\S*)`),
 			minVersion:    &semver.Version{Major: 1, Minor: 4, Patch: 0},
-			hint:          `Run "go get -u github.com/onsi/ginkgo/ginkgo".`,
+			maxVersion:    &semver.Version{Major: 2, Minor: 0, Patch: 0},
+			hint:          `Run "go install github.com/onsi/ginkgo/ginkgo@latest".`,
 		},
 		// FIXME add gomega check?
 		&binaryCheck{
@@ -113,7 +120,7 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"version"},
 			versionRegexp: regexp.MustCompile(`Version:"v(\d+\.\d+\.\d+)"`),
-			minVersion:    &semver.Version{Major: 3, Minor: 0, Patch: 0},
+			minVersion:    &semver.Version{Major: 3, Minor: 6, Patch: 0},
 		},
 		&binaryCheck{
 			name:          "llc",
@@ -140,12 +147,27 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 			ifNotFound:     checkInfo,
 			versionArgs:    []string{"--version"},
 			versionRegexp:  regexp.MustCompile(`Oracle VM VirtualBox Headless Interface (\d+\.\d+\.\d+\S*)`),
+			hint:           "run \"VBoxHeadless --help\" to diagnose why vboxheadless failed to execute",
 		},
 		&binaryCheck{
 			name:          "pip3",
 			ifNotFound:    checkWarning,
 			versionArgs:   []string{"--version"},
 			versionRegexp: regexp.MustCompile(`pip (\d+\.\d+\S*)`),
+		},
+		&binaryCheck{
+			name:          "cfssl",
+			ifNotFound:    checkWarning,
+			versionArgs:   []string{"version"},
+			versionRegexp: regexp.MustCompile(`Version: (.*)`),
+			hint:          "See https://github.com/cloudflare/cfssl#installation.",
+		},
+		&binaryCheck{
+			name:          "cfssljson",
+			ifNotFound:    checkWarning,
+			versionArgs:   []string{"-version"},
+			versionRegexp: regexp.MustCompile(`Version: (.*)`),
+			hint:          "See https://github.com/cloudflare/cfssl#installation.",
 		},
 		dockerGroupCheck{},
 	}
@@ -190,13 +212,13 @@ func rootCmdRun(cmd *cobra.Command, args []string) {
 		checks = append(checks,
 			etcNFSConfCheck{},
 			&iptablesRuleCheck{
-				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.34.0/24", "--dport", "111", "-j", "ACCEPT"},
+				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.61.0/24", "--dport", "111", "-j", "ACCEPT"},
 			},
 			&iptablesRuleCheck{
-				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.34.0/24", "--dport", "2049", "-j", "ACCEPT"},
+				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.61.0/24", "--dport", "2049", "-j", "ACCEPT"},
 			},
 			&iptablesRuleCheck{
-				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.34.0/24", "--dport", "20048", "-j", "ACCEPT"},
+				rule: []string{"INPUT", "-p", "tcp", "-s", "192.168.61.0/24", "--dport", "20048", "-j", "ACCEPT"},
 			},
 		)
 	}

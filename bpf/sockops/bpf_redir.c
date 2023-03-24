@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright (C) 2018-2020 Authors of Cilium */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright Authors of Cilium */
 
 #include <bpf/ctx/unspec.h>
 #include <bpf/api.h>
@@ -29,7 +29,7 @@ static __always_inline void sk_msg_extract4_key(const struct sk_msg_md *msg,
 	key->sip4 = msg->local_ip4;
 	key->family = ENDPOINT_KEY_IPV4;
 
-	key->sport = (bpf_ntohl(msg->local_port) >> 16);
+	key->sport = (bpf_htonl(msg->local_port) >> 16);
 	/* clang-7.1 or higher seems to think it can do a 16-bit read here
 	 * which unfortunately most kernels (as of October 2019) do not
 	 * support, which leads to verifier failures. Insert a READ_ONCE
@@ -39,7 +39,7 @@ static __always_inline void sk_msg_extract4_key(const struct sk_msg_md *msg,
 }
 
 __section("sk_msg")
-int bpf_redir_proxy(struct sk_msg_md *msg)
+int cil_redir_proxy(struct sk_msg_md *msg)
 {
 	struct remote_endpoint_info *info;
 	__u64 flags = BPF_F_INGRESS;
@@ -54,17 +54,17 @@ int bpf_redir_proxy(struct sk_msg_md *msg)
 	 * socket to avoid extra overhead. This would require the agent though
 	 * to flush the sock ops map on policy changes.
 	 */
-	info = lookup_ip4_remote_endpoint(key.dip4);
+	info = lookup_ip4_remote_endpoint(key.dip4, 0);
 	if (info != NULL && info->sec_label)
 		dst_id = info->sec_label;
 	else
 		dst_id = WORLD_ID;
 
-	verdict = policy_sk_egress(dst_id, key.sip4, key.dport);
+	verdict = policy_sk_egress(dst_id, key.sip4, (__u16)key.dport);
 	if (verdict >= 0)
 		msg_redirect_hash(msg, &SOCK_OPS_MAP, &key, flags);
 	return SK_PASS;
 }
 
-BPF_LICENSE("GPL");
+BPF_LICENSE("Dual BSD/GPL");
 int _version __section("version") = 1;

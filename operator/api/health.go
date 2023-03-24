@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package api
 
 import (
-	"github.com/cilium/cilium/api/v1/operator/server/restapi/operator"
 	"github.com/go-openapi/runtime/middleware"
+
+	"github.com/cilium/cilium/api/v1/operator/server/restapi/operator"
 )
 
 type getHealthz struct {

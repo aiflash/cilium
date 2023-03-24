@@ -3,7 +3,7 @@ swagger: '2.0'
 info:
   title: Cilium API
   description: Cilium
-  version: v1beta
+  version: v1beta1
 x-schemes:
 - unix
 basePath: "/v1"
@@ -426,6 +426,7 @@ paths:
       parameters:
       - "$ref": "#/parameters/ipam-family"
       - "$ref": "#/parameters/ipam-owner"
+      - "$ref": "#/parameters/ipam-pool"
       - "$ref": "#/parameters/ipam-expiration"
       responses:
         '201':
@@ -445,6 +446,7 @@ paths:
       parameters:
       - "$ref": "#/parameters/ipam-ip"
       - "$ref": "#/parameters/ipam-owner"
+      - "$ref": "#/parameters/ipam-pool"
       responses:
         '200':
           description: Success
@@ -468,6 +470,7 @@ paths:
       - ipam
       parameters:
       - "$ref": "#/parameters/ipam-release-arg"
+      - "$ref": "#/parameters/ipam-pool"
       responses:
         '200':
           description: Success
@@ -556,18 +559,6 @@ paths:
           x-go-name: Failure
           schema:
             "$ref": "#/definitions/Error"
-  "/policy/resolve":
-    get:
-      summary: Resolve policy for an identity context
-      tags:
-      - policy
-      parameters:
-      - "$ref": "#/parameters/trace-selector"
-      responses:
-        '200':
-          description: Success
-          schema:
-            "$ref": "#/definitions/PolicyTraceResult"
   "/policy/selectors":
     get:
       summary: See what selectors match which identities
@@ -641,6 +632,11 @@ paths:
         '500':
           description: Error while creating service
           x-go-name: Failure
+          schema:
+            "$ref": "#/definitions/Error"
+        '501':
+          description: Error while updating backend states
+          x-go-name: UpdateBackendFailure
           schema:
             "$ref": "#/definitions/Error"
     delete:
@@ -802,6 +798,21 @@ paths:
           x-go-name: Failure
           schema:
             "$ref": "#/definitions/Error"
+  "/cgroup-dump-metadata":
+    get:
+      summary: Retrieve cgroup metadata for all pods
+      tags:
+      - daemon
+      responses:
+        '200':
+          description: Success
+          schema:
+            "$ref": "#/definitions/CgroupDumpMetadata"
+        '500':
+          description: CgroupDumpMetadata get failed
+          x-go-name: Failure
+          schema:
+            "$ref": "#/definitions/Error"
   "/map":
     get:
       summary: List all open maps
@@ -826,7 +837,22 @@ paths:
             "$ref": "#/definitions/BPFMap"
         '404':
           description: Map not found
-
+  "/map/{name}/events":
+    get:
+      summary: Retrieves the recent event logs associated with this endpoint.
+      tags:
+      - daemon
+      parameters:
+      - "$ref": "#/parameters/map-name"
+      - "$ref": "#/parameters/follow"
+      responses:
+        '200':
+          description: Success
+          schema:
+            type: string
+            format: binary 
+        '404':
+          description: Map not found
   "/metrics/":
     get:
       summary: Retrieve cilium metrics
@@ -848,12 +874,13 @@ paths:
       summary: Retrieves the list of DNS lookups intercepted from all endpoints.
       description: |
         Retrieves the list of DNS lookups intercepted from endpoints,
-        optionally filtered by endpoint id, DNS name, or CIDR IP range.
+        optionally filtered by DNS name, CIDR IP range or source.
       tags:
       - policy
       parameters:
       - "$ref": "#/parameters/matchpattern"
       - "$ref": "#/parameters/cidr"
+      - "$ref": "#/parameters/source"
       responses:
         '200':
           description: Success
@@ -889,14 +916,15 @@ paths:
     get:
       summary: Retrieves the list of DNS lookups intercepted from an endpoint.
       description: |
-        Retrieves the list of DNS lookups intercepted from endpoints,
-        optionally filtered by endpoint id, DNS name, or CIDR IP range.
+        Retrieves the list of DNS lookups intercepted from the specific endpoint,
+        optionally filtered by endpoint id, DNS name, CIDR IP range or source.
       tags:
       - policy
       parameters:
       - "$ref": "#/parameters/endpoint-id"
       - "$ref": "#/parameters/matchpattern"
       - "$ref": "#/parameters/cidr"
+      - "$ref": "#/parameters/source"
       responses:
         '200':
           description: Success
@@ -951,6 +979,21 @@ paths:
             "$ref": "#/definitions/Error"
         '404':
           description: No IP cache entries with provided parameters found
+  "/node/ids":
+    get:
+      summary: List information about known node IDs
+      description: |
+        Retrieves a list of node IDs allocated by the agent and their
+        associated node IP addresses.
+      tags:
+      - daemon
+      responses:
+        '200':
+          description: Success
+          schema:
+            type: array
+            items:
+              "$ref": "#/definitions/NodeID"
 parameters:
   endpoint-id:
     name: id
@@ -1073,6 +1116,10 @@ parameters:
     name: owner
     in: query
     type: string
+  ipam-pool:
+    name: pool
+    in: query
+    type: string
   ipam-expiration:
     name: expiration
     in: header
@@ -1083,6 +1130,12 @@ parameters:
     required: true
     in: path
     type: string
+  follow:
+    name: follow
+    description: Whether to follow streamed requests
+    required: false
+    in: query
+    type: boolean
   matchpattern:
     name: matchpattern
     description: A toFQDNs compatible matchPattern expression
@@ -1095,7 +1148,12 @@ parameters:
     required: false
     in: query
     type: string
-
+  source:
+    name: source
+    description: Source from which FQDN entries come from
+    required: false
+    in: query
+    type: string
 
 definitions:
   Endpoint:
@@ -1410,6 +1468,15 @@ definitions:
           type: array
           items:
             type: string
+      rules-by-selector:
+        description: The policy rule labels identifying the policy rules this rule derives from, mapped by selector
+        type: object
+        additionalProperties:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
   L4Policy:
     description: |-
       L4 endpoint policy
@@ -1518,6 +1585,39 @@ definitions:
           wireguard:
             description: Status of the Wireguard agent
             "$ref": "#/definitions/WireguardStatus"
+  CgroupDumpMetadata:
+    description: cgroup full metadata
+    type: object
+    properties:
+      pod-metadatas:
+        type: array
+        items:
+          "$ref": "#/definitions/CgroupPodMetadata"
+  CgroupPodMetadata:
+    description: cgroup pod metadata
+    type: object
+    properties:
+      name:
+        type: string
+      namespace:
+        type: string
+      containers:
+        type: array
+        items:
+          "$ref": "#/definitions/CgroupContainerMetadata"
+      ips:
+        type: array
+        items:
+          type: string
+  CgroupContainerMetadata:
+    description: cgroup container metadata
+    type: object
+    properties:
+      cgroup-id:
+        type: integer
+        format: uint64
+      cgroup-path:
+        type: string
   IPAMResponse:
     description: IPAM configuration of an endpoint
     type: object
@@ -1714,6 +1814,9 @@ definitions:
       kvstore:
         description: Status of key/value datastore
         "$ref": "#/definitions/Status"
+      cni-file:
+        description: Status of the CNI configuration file
+        "$ref": "#/definitions/Status"
       container-runtime:
         description: Status of local container runtime
         "$ref": "#/definitions/Status"
@@ -1744,6 +1847,12 @@ definitions:
       proxy:
         description: Status of proxy
         "$ref": "#/definitions/ProxyStatus"
+      identity-range:
+        description: Status of identity range of the cluster
+        "$ref": "#/definitions/IdentityRange"
+      ipv6-big-tcp:
+        description: Status of IPv6 BIG TCP
+        "$ref": "#/definitions/IPV6BigTCP"
       bandwidth-manager:
         description: Status of bandwidth manager
         "$ref": "#/definitions/BandwidthManager"
@@ -1778,6 +1887,9 @@ definitions:
       encryption:
         description: Status of transparent encryption
         "$ref": "#/definitions/EncryptionStatus"
+      cni-chaining:
+        description: Status of CNI chaining
+        "$ref": "#/definitions/CNIChainingStatus"
   Status:
     description: Status of an individual component
     type: object
@@ -1994,7 +2106,65 @@ definitions:
                 type: array
                 items:
                   type: string
+          socketLB:
+            description: |-
+
+
+              +k8s:deepcopy-gen=true
+            type: object
+            properties:
+              enabled:
+                type: boolean
           sessionAffinity:
+            description: |-
+
+
+              +k8s:deepcopy-gen=true
+            type: object
+            properties:
+              enabled:
+                type: boolean
+          gracefulTermination:
+            description: |-
+
+
+              +k8s:deepcopy-gen=true
+            type: object
+            properties:
+              enabled:
+                type: boolean
+          nat46X64:
+            description: |-
+
+
+              +k8s:deepcopy-gen=true
+            type: object
+            properties:
+              enabled:
+                type: boolean
+              service:
+                description: |-
+
+
+                  +k8s:deepcopy-gen=true
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+              gateway:
+                description: |-
+
+
+                  +k8s:deepcopy-gen=true
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  prefixes:
+                    type: array
+                    items:
+                      type: string
+          socketLBTracing:
             description: |-
 
 
@@ -2197,8 +2367,6 @@ definitions:
         type: integer
       datapathMode:
         "$ref": "#/definitions/DatapathMode"
-      ipvlanConfiguration:
-        "$ref": "#/definitions/IpvlanConfiguration"
       ipam-mode:
         description: Configured IPAM mode
         type: string
@@ -2221,25 +2389,17 @@ definitions:
         description: Config map which contains all the active daemon configurations
         additionalProperties:
           type: object
+      GSOMaxSize:
+        description: Maximum GSO size on workload facing devices
+        type: integer
+      GROMaxSize:
+        description: Maximum GRO size on workload facing devices
+        type: integer
   DatapathMode:
     description: Datapath mode
     type: string
     enum:
       - veth
-      - ipvlan
-  IpvlanConfiguration:
-    description: Setup for datapath when operating in ipvlan mode.
-    type: object
-    properties:
-      masterDeviceIndex:
-        description: Workload facing ipvlan master device ifindex.
-        type: integer
-      operationMode:
-        description: Mode in which ipvlan setup operates.
-        type: string
-        enum:
-          - L3
-          - L3S
   EndpointConfigurationSpec:
     description: An endpoint's configuration
     type: object
@@ -2290,6 +2450,9 @@ definitions:
           "$ref": "#/definitions/NodeAddressingElement"
       health-endpoint-address:
         description: Address used for probing cluster connectivity
+        "$ref": "#/definitions/NodeAddressing"
+      ingress-address:
+        description: Source address for Ingress listener
         "$ref": "#/definitions/NodeAddressing"
   NodeAddressing:
     description: |-
@@ -2351,6 +2514,7 @@ definitions:
         enum:
           - TCP
           - UDP
+          - SCTP
           - ICMP
           - ICMPV6
           - ANY
@@ -2454,6 +2618,24 @@ definitions:
       nodeName:
         description: Optional name of the node on which this backend runs
         type: string
+      state:
+        description: State of the backend for load-balancing service traffic
+        type: string
+        enum:
+          - active
+          - terminating
+          - quarantined
+          - maintenance
+      preferred:
+        description: |-
+          Indicator if this backend is preferred in the context of clustermesh service affinity. The value is set based
+          on related annotation of global service. Applicable for active state only.
+        type: boolean
+      weight:
+        description: Backend weight
+        type: integer
+        format: uint16
+        x-nullable: true
   LRPBackend:
     description: Pod backend of an LRP
     type: object
@@ -2541,11 +2723,30 @@ definitions:
             - LoadBalancer
             - LocalRedirect
           trafficPolicy:
-            description: Service traffic policy
+            description: Service external traffic policy (deprecated in favor of extTrafficPolicy)
             type: string
             enum:
             - Cluster
             - Local
+          extTrafficPolicy:
+            description: Service external traffic policy
+            type: string
+            enum:
+            - Cluster
+            - Local
+          intTrafficPolicy:
+            description: Service internal traffic policy
+            type: string
+            enum:
+            - Cluster
+            - Local
+          natPolicy:
+            description: Service protocol NAT policy
+            type: string
+            enum:
+            - None
+            - Nat46
+            - Nat64
           healthCheckNodePort:
             description: Service health check node port
             type: integer
@@ -2556,6 +2757,12 @@ definitions:
           namespace:
             description: Service namespace  (e.g. Kubernetes namespace)
             type: string
+      updateServices:
+        description: |
+          Update all services selecting the backends with their given states
+          (id and frontend are ignored)
+        type: boolean
+
   ServiceStatus:
     description: Configuration of a service
     type: object
@@ -2598,6 +2805,7 @@ definitions:
         enum:
         - TCP
         - UDP
+        - SCTP
         - ANY
   RecorderSpec:
     description: Configuration of a recorder
@@ -2678,6 +2886,18 @@ definitions:
         type: array
         items:
           "$ref": "#/definitions/ProxyRedirect"
+  IdentityRange:
+    description: |-
+      Status of identity range of the cluster
+
+      +k8s:deepcopy-gen=true
+    properties:
+      min-identity:
+        description: Minimum identity of the cluster
+        type: integer
+      max-identity:
+        description: Maximum identity of the cluster
+        type: integer
   ProxyRedirect:
     description: Configured proxy redirection state
     type: object
@@ -2743,6 +2963,16 @@ definitions:
       forwarded:
         description: Number of messages forwarded
         type: integer
+  IPV6BigTCP:
+    description: |-
+      Status of IPv6 BIG TCP
+
+      +k8s:deepcopy-gen=true
+    type: object
+    properties:
+      enabled:
+        description: Is IPv6 BIG TCP enabled
+        type: boolean
   BandwidthManager:
     description: |-
       Status of bandwidth manager
@@ -2757,6 +2987,11 @@ definitions:
         type: array
         items:
           type: string
+      congestionControl:
+        type: string
+        enum:
+        - cubic
+        - bbr
   Masquerading:
     description: |-
       Status of masquerading
@@ -2893,6 +3128,36 @@ definitions:
           last-failure-msg:
             description: Error message of last failed run
             type: string
+  MapEvent:
+    description: Event on Map
+    type: object
+    properties:
+      timestamp:
+        description: Timestamp when the event occurred
+        type: string
+        format: date-time
+      key:
+        description: Map key on which the event occured
+        type: string
+      value:
+        description: Map value on which the event occured
+        type: string
+      action:
+        description: Action type for event
+        type: string
+        enum:
+        - update
+        - delete
+      desired-action:
+        description: Desired action to be performed after this event
+        type: string
+        enum:
+        - ok
+        - insert
+        - delete
+      last-error:
+        description: Last error seen while performing desired action
+        type: string
   BPFMapList:
     description: List of BPF Maps
     type: object
@@ -3016,7 +3281,7 @@ definitions:
         description: The TTL in the DNS response
         type: integer
       lookup-time:
-        description: The absolute time when this data was recieved
+        description: The absolute time when this data was received
         type: string
         format: date-time
       expiration-time:
@@ -3029,6 +3294,21 @@ definitions:
       source:
         description: The reason this FQDN IP association exists. Either a DNS lookup or an ongoing connection to an IP that was created by a DNS lookup.
         type: string
+  NodeID:
+    description: Node ID with associated node IP addresses
+    type: object
+    required:
+      - id
+      - ips
+    properties:
+      id:
+        description: ID allocated by the agent for the node
+        type: integer
+      ips:
+        description: IP addresses of the node associated with the ID in the agent
+        type: array
+        items:
+            type: string
   IPListEntry:
     description: IP entry with metadata
     type: object
@@ -3070,6 +3350,7 @@ definitions:
       Policy specs.
 
       +deepequal-gen=true
+      +k8s:deepcopy-gen=true
     type: array
     items:
       "$ref": "#/definitions/Port"
@@ -3091,6 +3372,20 @@ definitions:
       wireguard:
         description: Status of the Wireguard agent
         "$ref": "#/definitions/WireguardStatus"
+  CNIChainingStatus:
+    description: |-
+      Status of CNI chaining
+
+      +k8s:deepcopy-gen=true
+    properties:
+      mode:
+        type: string
+        enum:
+          - none
+          - aws-cni
+          - flannel
+          - generic-veth
+          - portmap
   WireguardStatus:
     description: |-
       Status of the Wireguard agent

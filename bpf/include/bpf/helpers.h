@@ -1,5 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright (C) 2016-2020 Authors of Cilium */
+/* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
+/* Copyright Authors of Cilium */
 
 #ifndef __BPF_HELPERS__
 #define __BPF_HELPERS__
@@ -103,5 +103,18 @@ static struct bpf_sock *BPF_FUNC(sk_lookup_udp, void *ctx,
 static int BPF_FUNC_REMAP(get_socket_opt, void *ctx, int level, int optname,
 			  void *optval, int optlen) =
 	(void *)BPF_FUNC_getsockopt;
+
+static __u64 BPF_FUNC(get_current_cgroup_id);
+
+static int BPF_FUNC(set_retval, int retval);
+
+static inline int try_set_retval(int retval __maybe_unused)
+{
+#ifdef HAVE_SET_RETVAL
+	return set_retval(retval);
+#else
+	return 0;
+#endif
+}
 
 #endif /* __BPF_HELPERS__ */

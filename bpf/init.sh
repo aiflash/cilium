@@ -1,43 +1,33 @@
 #!/bin/bash
-#
-# Copyright 2016-2020 Authors of Cilium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright Authors of Cilium
 
-LIB=$1
-RUNDIR=$2
-IP4_HOST=$3
-IP6_HOST=$4
-MODE=$5
-TUNNEL_MODE=$6
+LIB=${1}
+RUNDIR=${2}
+PROCSYSNETDIR=${3}
+SYSCLASSNETDIR=${4}
+IP4_HOST=${5}
+IP6_HOST=${6}
+MODE=${7}
+TUNNEL_MODE=${8}
 # Only set if TUNNEL_MODE = "vxlan", "geneve"
-TUNNEL_PORT=$7
-# Only set if MODE = "direct", "ipvlan"
-NATIVE_DEVS=$8
-HOST_DEV1=$9
-HOST_DEV2=${10}
-MTU=${11}
-HOSTLB=${12}
-HOSTLB_UDP=${13}
-HOSTLB_PEER=${14}
-CGROUP_ROOT=${15}
-BPFFS_ROOT=${16}
-NODE_PORT=${17}
-NODE_PORT_BIND=${18}
-MCPU=${19}
-NR_CPUS=${20}
-ENDPOINT_ROUTES=${21}
-PROXY_RULE=${22}
+TUNNEL_PORT=${9}
+# Only set if MODE = "direct"
+NATIVE_DEVS=${10}
+HOST_DEV1=${11}
+HOST_DEV2=${12}
+MTU=${13}
+SOCKETLB=${14}
+SOCKETLB_PEER=${15}
+CGROUP_ROOT=${16}
+BPFFS_ROOT=${17}
+NODE_PORT=${18}
+NODE_PORT_BIND=${19}
+MCPU=${20}
+NR_CPUS=${21}
+ENDPOINT_ROUTES=${22}
+PROXY_RULE=${23}
+FILTER_PRIO=${24}
 
 ID_HOST=1
 ID_WORLD=2
@@ -64,14 +54,14 @@ function setup_dev()
 	ip link set $NAME up
 
 	if [ "$IP6_HOST" != "<nil>" ]; then
-		echo 1 > /proc/sys/net/ipv6/conf/${NAME}/forwarding
+		echo 1 > "${PROCSYSNETDIR}/ipv6/conf/${NAME}/forwarding"
 	fi
 
 	if [ "$IP4_HOST" != "<nil>" ]; then
-		echo 1 > /proc/sys/net/ipv4/conf/${NAME}/forwarding
-		echo 0 > /proc/sys/net/ipv4/conf/${NAME}/rp_filter
-		echo 1 > /proc/sys/net/ipv4/conf/${NAME}/accept_local
-		echo 0 > /proc/sys/net/ipv4/conf/${NAME}/send_redirects
+		echo 1 > "${PROCSYSNETDIR}/ipv4/conf/${NAME}/forwarding"
+		echo 0 > "${PROCSYSNETDIR}/ipv4/conf/${NAME}/rp_filter"
+		echo 1 > "${PROCSYSNETDIR}/ipv4/conf/${NAME}/accept_local"
+		echo 0 > "${PROCSYSNETDIR}/ipv4/conf/${NAME}/send_redirects"
 	fi
 }
 
@@ -119,10 +109,6 @@ function move_local_rules()
 
 function setup_proxy_rules()
 {
-	if [ "$MODE" = "ipvlan" ]; then
-		return
-	fi
-
 	# Any packet from an ingress proxy uses a separate routing table that routes
 	# the packet back to the cilium host device.
 	from_ingress_rulespec="fwmark 0xA00/0xF00 pref 10 lookup $PROXY_RT_TABLE"
@@ -224,12 +210,13 @@ function bpf_compile()
 	      -Wno-unknown-warning-option			\
 	      -Wno-gnu-variable-sized-type-not-at-end		\
 	      -Wdeclaration-after-statement			\
+	      -Wimplicit-int-conversion -Wenum-conversion	\
 	      -I. -I$DIR -I$LIB -I$LIB/include			\
 	      -D__NR_CPUS__=$NR_CPUS				\
 	      -DENABLE_ARP_RESPONDER=1				\
 	      $EXTRA_OPTS					\
 	      -c $LIB/$IN -o - |				\
-	llc -march=bpf -mcpu=$MCPU -mattr=dwarfris -filetype=$TYPE -o $OUT
+	llc -march=bpf -mcpu=$MCPU -filetype=$TYPE -o $OUT
 }
 
 function bpf_unload()
@@ -256,14 +243,14 @@ function bpf_load()
 	OPTS="${OPTS} -DNODE_MAC=${NODE_MAC} -DCALLS_MAP=${CALLS_MAP}"
 	bpf_compile $IN $OUT obj "$OPTS"
 	tc qdisc replace dev $DEV clsact || true
-	[ -z "$(tc filter show dev $DEV $WHERE | grep -v 'pref 1 bpf chain 0 $\|pref 1 bpf chain 0 handle 0x1')" ] || tc filter del dev $DEV $WHERE
-	cilium bpf migrate-maps -s $OUT
-	set +e
-	tc filter replace dev $DEV $WHERE prio 1 handle 1 bpf da obj $OUT sec $SEC
-	RETCODE=$?
-	set -e
-	cilium bpf migrate-maps -e $OUT -r $RETCODE
-	return $RETCODE
+	[ -z "$(tc filter show dev $DEV $WHERE | grep -v "pref $FILTER_PRIO bpf chain 0 $\|pref $FILTER_PRIO bpf chain 0 handle 0x1")" ] || tc filter del dev $DEV $WHERE
+
+	cilium bpf migrate-maps -s "$OUT"
+
+	if ! tc filter replace dev "$DEV" "$WHERE" prio "$FILTER_PRIO" handle 1 bpf da obj "$OUT" sec "$SEC"; then
+		cilium bpf migrate-maps -e "$OUT" -r 1
+		return 1
+	fi
 }
 
 function bpf_load_cgroups()
@@ -276,41 +263,91 @@ function bpf_load_cgroups()
 	CALLS_MAP=$6
 	CGRP=$7
 	BPFMNT=$8
+	NAME=$9
 
 	OPTS="${OPTS} -DCALLS_MAP=${CALLS_MAP}"
-	bpf_compile $IN $OUT obj "$OPTS"
+	bpf_compile "$IN" "$OUT" obj "$OPTS"
 
 	TMP_FILE="$BPFMNT/tc/globals/cilium_cgroups_$WHERE"
-	rm -f $TMP_FILE
+	rm -f "$TMP_FILE"
 
-	cilium bpf migrate-maps -s $OUT
-	set +e
-	tc exec bpf pin $TMP_FILE obj $OUT type $PROG_TYPE attach_type $WHERE sec "cgroup/$WHERE"
-	RETCODE=$?
-	set -e
-	cilium bpf migrate-maps -e $OUT -r $RETCODE
+	cilium bpf migrate-maps -s "$OUT"
 
-	if [ "$RETCODE" -eq "0" ]; then
-		set +e
-		bpftool cgroup attach $CGRP $WHERE pinned $TMP_FILE
-		RETCODE=$?
-		set -e
-		rm -f $TMP_FILE
+	if ! tc exec bpf pin "$TMP_FILE" obj "$OUT" type "$PROG_TYPE" attach_type "$WHERE" sec "cgroup/$WHERE"; then
+		cilium bpf migrate-maps -e "$OUT" -r 1
+		return 1
 	fi
-	return $RETCODE
+
+	set +e
+	bpftool link detach pinned "$BPFFS_ROOT/cilium/socketlb/links/cgroup/$NAME" || true
+	rm -f "$BPFFS_ROOT/cilium/socketlb/links/cgroup/$NAME"
+	set -e
+
+	if bpftool cgroup attach "$CGRP" "$WHERE" pinned "$TMP_FILE"; then
+		rm -f "$TMP_FILE"
+		return 0
+	fi
+
+	# Program might've been attached in multi-mode by a newer version of Cilium or
+	# by another tool. This means 'bpftool cgroup attach' won't succeed unless
+	# any/all attached programs are removed.
+	bpf_clear_cgroups "$CGRP" "$WHERE" "$NAME"
+
+	if bpftool cgroup attach "$CGRP" "$WHERE" pinned "$TMP_FILE"; then
+		rm -f "$TMP_FILE"
+		return 0
+	fi
+
+	rm -f "$TMP_FILE"
+	cilium bpf migrate-maps -e "$OUT" -r 1
+	return 1
 }
 
 function bpf_clear_cgroups()
 {
 	CGRP=$1
 	HOOK=$2
+	NAME=$3
+
+	# Since Linux commit 1ba5ad36e00f ("bpftool: Use libbpf_bpf_attach_type_str"),
+	# bpftool uses the libbpf_bpf_attach_type_str() format in 'bpftool cgroup
+	# show' output. Perform a naive translation to ensure compatibility with prior
+	# bpftool versions and to avoid updating the hook name at all call sites. The
+	# transformed string can be used in a suffix match against the new format.
+
+	# Examples: (old -> transformed, new)
+	# connect4 -> 4_connect, cgroup_inet4_connect
+	# post_bind6 -> 6_post_bind, cgroup_inet6_post_bind
+	# sendmsg4 -> 4_sendmsg, cgroup_udp4_sendmsg
+
+	# There is no inet4/6 variant of e.g. sendmsg, so it's safe to assume the
+	# intended udp4/6 hook is selected.
+	newhook=$(echo "$HOOK" | sed -E 's/([a-z_]+)([0-9])/\2_\1/')
 
 	set +e
-	ID=$(bpftool cgroup show $CGRP | grep -w $HOOK | awk '{print $1}')
+	bpftool link detach pinned "$BPFFS_ROOT/cilium/socketlb/links/cgroup/$NAME" || true
+	rm -f "$BPFFS_ROOT/cilium/socketlb/links/cgroup/$NAME"
 	set -e
-	if [ -n "$ID" ]; then
-		bpftool cgroup detach $CGRP $HOOK id $ID
-	fi
+
+	# Get all programs attached to the given cgroup and store their ids in a
+	# newline-separated string. Perform a full match on the 'legacy' hook name
+	# appearing in older versions of bpftool, but perform a suffix match using the
+	# 'new' hook name.
+	ids=$(bpftool cgroup show "$CGRP" -j |
+		jq --arg legacy "$HOOK" --arg new "$newhook" '.[] |
+			select(
+				.attach_type == $legacy or
+				(.attach_type | endswith($new))
+			) | .id')
+
+	# Cilium versions 1.14 and later use ebpf-go to attach cgroup programs, which
+	# potentially attaches programs using the 'multi' flag if the kernel is recent
+	# enough to support the flag, but too old to support bpf_link. Detach all
+	# programs at the given hook since we can't reliably determine which ones
+	# Cilium owns.
+	for id in $ids; do
+		bpftool cgroup detach "$CGRP" "$HOOK" id "$id"
+	done
 }
 
 function create_encap_dev()
@@ -345,7 +382,7 @@ case "${MODE}" in
 		echo "#endif /* CILIUM_NET_MAC */" >> $RUNDIR/globals/node_config.h
 
 		sed -i '/^#.*HOST_IFINDEX.*$/d' $RUNDIR/globals/node_config.h
-		HOST_IDX=$(cat /sys/class/net/${HOST_DEV2}/ifindex)
+		HOST_IDX=$(cat "${SYSCLASSNETDIR}/${HOST_DEV2}/ifindex")
 		echo "#define HOST_IFINDEX $HOST_IDX" >> $RUNDIR/globals/node_config.h
 
 		sed -i '/^#.*HOST_IFINDEX_MAC.*$/d' $RUNDIR/globals/node_config.h
@@ -354,10 +391,10 @@ case "${MODE}" in
 		echo "#define HOST_IFINDEX_MAC { .addr = ${HOST_MAC}}" >> $RUNDIR/globals/node_config.h
 
 		sed -i '/^#.*CILIUM_IFINDEX.*$/d' $RUNDIR/globals/node_config.h
-		CILIUM_IDX=$(cat /sys/class/net/${HOST_DEV1}/ifindex)
+		CILIUM_IDX=$(cat "${SYSCLASSNETDIR}/${HOST_DEV1}/ifindex")
 		echo "#define CILIUM_IFINDEX $CILIUM_IDX" >> $RUNDIR/globals/node_config.h
 
-		CILIUM_EPHEMERAL_MIN=$(cat /proc/sys/net/ipv4/ip_local_port_range | awk '{print $1}')
+		CILIUM_EPHEMERAL_MIN=$(cat "${PROCSYSNETDIR}/ipv4/ip_local_port_range" | awk '{print $1}')
 		echo "#define EPHEMERAL_MIN $CILIUM_EPHEMERAL_MIN" >> $RUNDIR/globals/node_config.h
 esac
 
@@ -367,7 +404,7 @@ esac
 		[ -n "$(ip -6 addr show to $IP6_HOST dev $HOST_DEV1)" ] || ip -6 addr add $IP6_HOST dev $HOST_DEV1
 	fi
 	if [ "$IP4_HOST" != "<nil>" ]; then
-		[ -n "$(ip -4 addr show to $IP4_HOST dev $HOST_DEV1)" ] || ip -4 addr add $IP4_HOST dev $HOST_DEV1 scope link
+		[ -n "$(ip -4 addr show to $IP4_HOST dev $HOST_DEV1)" ] || ip -4 addr add $IP4_HOST dev $HOST_DEV1
 	fi
 
 if [ "$PROXY_RULE" = "true" ]; then
@@ -393,7 +430,7 @@ if [ "$MODE" = "ipip" ]; then
 		}
 		setup_dev $ENCAP_DEV || encap_fail
 
-		ENCAP_IDX=$(cat /sys/class/net/${ENCAP_DEV}/ifindex)
+		ENCAP_IDX=$(cat "${SYSCLASSNETDIR}/${ENCAP_DEV}/ifindex")
 		sed -i '/^#.*ENCAP4_IFINDEX.*$/d' $RUNDIR/globals/node_config.h
 		echo "#define ENCAP4_IFINDEX $ENCAP_IDX" >> $RUNDIR/globals/node_config.h
 	else
@@ -414,7 +451,7 @@ if [ "$MODE" = "ipip" ]; then
 		}
 		setup_dev $ENCAP_DEV || encap_fail
 
-		ENCAP_IDX=$(cat /sys/class/net/${ENCAP_DEV}/ifindex)
+		ENCAP_IDX=$(cat "${SYSCLASSNETDIR}/${ENCAP_DEV}/ifindex")
 		sed -i '/^#.*ENCAP6_IFINDEX.*$/d' $RUNDIR/globals/node_config.h
 		echo "#define ENCAP6_IFINDEX $ENCAP_IDX" >> $RUNDIR/globals/node_config.h
 	else
@@ -436,7 +473,6 @@ if [ "${TUNNEL_MODE}" != "<nil>" ]; then
 	ENCAP_DEV="cilium_${TUNNEL_MODE}"
 
 	ip link show $ENCAP_DEV || create_encap_dev
-	ip link set $ENCAP_DEV mtu $MTU || encap_fail
 
 	if [ "${TUNNEL_PORT}" != "<nil>" ]; then
 		ip -details link show $ENCAP_DEV | grep "dstport $TUNNEL_PORT" || {
@@ -445,9 +481,10 @@ if [ "${TUNNEL_MODE}" != "<nil>" ]; then
 		}
 	fi
 
+	ip link set $ENCAP_DEV mtu $MTU || encap_fail
 	setup_dev $ENCAP_DEV || encap_fail
 
-	ENCAP_IDX=$(cat /sys/class/net/${ENCAP_DEV}/ifindex)
+	ENCAP_IDX=$(cat "${SYSCLASSNETDIR}/${ENCAP_DEV}/ifindex")
 	sed -i '/^#.*ENCAP_IFINDEX.*$/d' $RUNDIR/globals/node_config.h
 	echo "#define ENCAP_IFINDEX $ENCAP_IDX" >> $RUNDIR/globals/node_config.h
 
@@ -456,20 +493,24 @@ if [ "${TUNNEL_MODE}" != "<nil>" ]; then
 	if [ "$NODE_PORT" = "true" ]; then
 		COPTS="${COPTS} -DDISABLE_LOOPBACK_LB"
 	fi
-	bpf_load $ENCAP_DEV "$COPTS" "ingress" bpf_overlay.c bpf_overlay.o from-overlay ${CALLS_MAP}
-	bpf_load $ENCAP_DEV "$COPTS" "egress" bpf_overlay.c bpf_overlay.o to-overlay ${CALLS_MAP}
+
+	bpf_load "$ENCAP_DEV" "$COPTS" ingress bpf_overlay.c bpf_overlay.o from-overlay "$CALLS_MAP"
+	bpf_load "$ENCAP_DEV" "$COPTS" egress bpf_overlay.c bpf_overlay.o to-overlay "$CALLS_MAP"
+
+	cilium bpf migrate-maps -e bpf_overlay.o -r 0
+
 else
 	# Remove eventual existing encapsulation device from previous run
 	ip link del cilium_vxlan 2> /dev/null || true
 	ip link del cilium_geneve 2> /dev/null || true
 fi
 
-if [ "$MODE" = "direct" ] || [ "$MODE" = "ipvlan" ] || [ "$NODE_PORT" = "true" ] ; then
+if [ "$MODE" = "direct" ] || [ "$NODE_PORT" = "true" ] ; then
 	if [ "$NATIVE_DEVS" == "<nil>" ]; then
 		echo "No device specified for $MODE mode, ignoring..."
 	else
 		if [ "$IP6_HOST" != "<nil>" ]; then
-			echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+			echo 1 > "${PROCSYSNETDIR}/ipv6/conf/all/forwarding"
 		fi
 		echo "$NATIVE_DEVS" > $RUNDIR/device.state
 	fi
@@ -496,89 +537,78 @@ for iface in $(ip -o -a l | awk '{print $2}' | cut -d: -f1 | cut -d@ -f1 | grep 
 	done
 	$found && continue
 	for where in ingress egress; do
-		if tc filter show dev "$iface" "$where" | grep -q "bpf_netdev[^\.]*.o"; then
-			echo "Removing bpf_netdev.o from $where of $iface"
-			tc filter del dev "$iface" "$where" || true
-		fi
-		if tc filter show dev "$iface" "$where" | grep -q "bpf_host.o"; then
-			echo "Removing bpf_host.o from $where of $iface"
+		# iproute2 uses the filename and section (bpf_overlay.o:[from-overlay]) as
+		# the filter name. Filters created by the Go bpf loader contain the bpf
+		# function and interface name, like cil_from_netdev-eth0.
+		# Only detach programs known to be attached to 'physical' network devices.
+		if tc filter show dev "$iface" "$where" | grep -qE "\b(bpf_host|cil_from_netdev|cil_to_netdev)"; then
+			echo "Removing $where TC filter from interface $iface"
 			tc filter del dev "$iface" "$where" || true
 		fi
 	done
 done
 
-if [ "$HOSTLB" = "true" ]; then
+if [ "$SOCKETLB" = "true" ]; then
 	if [ "$IP6_HOST" != "<nil>" ]; then
-		echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+		echo 1 > "${PROCSYSNETDIR}/ipv6/conf/all/forwarding"
 	fi
 
 	CALLS_MAP="cilium_calls_lb"
 	COPTS=""
-	if [ "$IP6_HOST" != "<nil>" ] || [ "$IP4_HOST" != "<nil>" ] && [ -f /proc/sys/net/ipv6/conf/all/forwarding ]; then
-		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr connect6 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
-		if [ "$HOSTLB_PEER" = "true" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr getpeername6 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
+	if [ "$IP6_HOST" != "<nil>" ] || [ "$IP4_HOST" != "<nil>" ] && [ -f "${PROCSYSNETDIR}/ipv6/conf/all/forwarding" ]; then
+		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr connect6 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock6_connect
+		if [ "$SOCKETLB_PEER" = "true" ]; then
+			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr getpeername6 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock6_getpeername
 		fi
 		if [ "$NODE_PORT" = "true" ] && [ "$NODE_PORT_BIND" = "true" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sock post_bind6 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
+			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sock post_bind6 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock6_post_bind
 		else
-			bpf_clear_cgroups $CGROUP_ROOT post_bind6
+			bpf_clear_cgroups "$CGROUP_ROOT" post_bind6 cil_sock6_post_bind
 		fi
 		if [ "$MODE" = "ipip" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr bind6 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
+			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr bind6 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock6_pre_bind
 		else
-			bpf_clear_cgroups $CGROUP_ROOT bind6
+			bpf_clear_cgroups "$CGROUP_ROOT" bind6 cil_sock6_pre_bind
 		fi
-		if [ "$HOSTLB_UDP" = "true" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr sendmsg6 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr recvmsg6 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
-		else
-			bpf_clear_cgroups $CGROUP_ROOT sendmsg6
-			bpf_clear_cgroups $CGROUP_ROOT recvmsg6
-		fi
+		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr sendmsg6 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock6_sendmsg
+		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr recvmsg6 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock6_recvmsg
 	fi
 	if [ "$IP4_HOST" != "<nil>" ]; then
-		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr connect4 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
-		if [ "$HOSTLB_PEER" = "true" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr getpeername4 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
+		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr connect4 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock4_connect
+		if [ "$SOCKETLB_PEER" = "true" ]; then
+			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr getpeername4 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock4_getpeername
 		fi
 		if [ "$NODE_PORT" = "true" ] && [ "$NODE_PORT_BIND" = "true" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sock post_bind4 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
+			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sock post_bind4 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock4_post_bind
 		else
-			bpf_clear_cgroups $CGROUP_ROOT post_bind4
+			bpf_clear_cgroups "$CGROUP_ROOT" post_bind4 cil_sock4_post_bind
 		fi
 		if [ "$MODE" = "ipip" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr bind4 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
+			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr bind4 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock4_pre_bind
 		else
-			bpf_clear_cgroups $CGROUP_ROOT bind4
+			bpf_clear_cgroups "$CGROUP_ROOT" bind4 cil_sock4_pre_bind
 		fi
-		if [ "$HOSTLB_UDP" = "true" ]; then
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr sendmsg4 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
-			bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr recvmsg4 $CALLS_MAP $CGROUP_ROOT $BPFFS_ROOT
-		else
-			bpf_clear_cgroups $CGROUP_ROOT sendmsg4
-			bpf_clear_cgroups $CGROUP_ROOT recvmsg4
-		fi
+		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr sendmsg4 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock4_sendmsg
+		bpf_load_cgroups "$COPTS" bpf_sock.c bpf_sock.o sockaddr recvmsg4 "$CALLS_MAP" "$CGROUP_ROOT" "$BPFFS_ROOT" cil_sock4_recvmsg
 	fi
+
+	cilium bpf migrate-maps -e bpf_sock.o -r 0
+
 else
-	bpf_clear_cgroups $CGROUP_ROOT bind4
-	bpf_clear_cgroups $CGROUP_ROOT bind6
-	bpf_clear_cgroups $CGROUP_ROOT post_bind4
-	bpf_clear_cgroups $CGROUP_ROOT post_bind6
-	bpf_clear_cgroups $CGROUP_ROOT connect4
-	bpf_clear_cgroups $CGROUP_ROOT connect6
-	bpf_clear_cgroups $CGROUP_ROOT sendmsg4
-	bpf_clear_cgroups $CGROUP_ROOT sendmsg6
-	bpf_clear_cgroups $CGROUP_ROOT recvmsg4
-	bpf_clear_cgroups $CGROUP_ROOT recvmsg6
-	bpf_clear_cgroups $CGROUP_ROOT getpeername4
-	bpf_clear_cgroups $CGROUP_ROOT getpeername6
+	bpf_clear_cgroups "$CGROUP_ROOT" bind4 cil_sock4_pre_bind
+	bpf_clear_cgroups "$CGROUP_ROOT" bind6 cil_sock6_pre_bind
+	bpf_clear_cgroups "$CGROUP_ROOT" post_bind4 cil_sock4_post_bind
+	bpf_clear_cgroups "$CGROUP_ROOT" post_bind6 cil_sock6_post_bind
+	bpf_clear_cgroups "$CGROUP_ROOT" connect4 cil_sock4_connect
+	bpf_clear_cgroups "$CGROUP_ROOT" connect6 cil_sock6_connect
+	bpf_clear_cgroups "$CGROUP_ROOT" sendmsg4 cil_sock4_sendmsg
+	bpf_clear_cgroups "$CGROUP_ROOT" sendmsg6 cil_sock6_sendmsg
+	bpf_clear_cgroups "$CGROUP_ROOT" recvmsg4 cil_sock4_recvmsg
+	bpf_clear_cgroups "$CGROUP_ROOT" recvmsg6 cil_sock6_recvmsg
+	bpf_clear_cgroups "$CGROUP_ROOT" getpeername4 cil_sock4_getpeername
+	bpf_clear_cgroups "$CGROUP_ROOT" getpeername6 cil_sock6_getpeername
 fi
 
 if [ "$HOST_DEV1" != "$HOST_DEV2" ]; then
 	bpf_unload $HOST_DEV2 "egress"
 fi
-
-# Compile dummy BPF file containing all shared struct definitions used by
-# pkg/alignchecker to validate C and Go equivalent struct alignments
-bpf_compile bpf_alignchecker.c bpf_alignchecker.o obj ""

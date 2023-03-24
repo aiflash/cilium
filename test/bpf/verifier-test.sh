@@ -1,18 +1,6 @@
 #!/bin/bash
-#
-# Copyright 2018-2021 Authors of Cilium
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright Authors of Cilium
 
 set -eo pipefail
 
@@ -24,7 +12,8 @@ MAPTOOL=$(dirname $0)/../../tools/maptool/maptool
 ALL_TC_PROGS="bpf_lxc bpf_host bpf_network bpf_overlay"
 ALL_CG_PROGS="bpf_sock sockops/bpf_sockops sockops/bpf_redir"
 ALL_XDP_PROGS="bpf_xdp"
-IGNORED_PROGS="bpf_alignchecker tests/bpf_ct_tests custom/bpf_custom"
+IGNORED_PROGS="bpf_alignchecker tests/bpf_ct_tests tests/bpf_nat_tests \
+               custom/bpf_custom"
 ALL_PROGS="${IGNORED_PROGS} ${ALL_CG_PROGS} ${ALL_TC_PROGS} ${ALL_XDP_PROGS}"
 
 # if {TC,CG,XDP}_PROGS is set (even if empty) use the existing value.

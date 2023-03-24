@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2018 Authors of Cilium
+// Copyright Authors of Cilium
 
 package sockops
 
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/cgroups"
 	"github.com/cilium/cilium/pkg/datapath/loader"
@@ -20,8 +22,6 @@ import (
 	"github.com/cilium/cilium/pkg/logging"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/option"
-
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -276,7 +276,7 @@ func bpfLoadMapProg(object string, load string) error {
 		return err
 	}
 
-	_mapID, err := bpftoolGetMapID("bpf_sockops", sockMap)
+	_mapID, err := bpftoolGetMapID(eSockops, sockMap)
 	mapID := strconv.Itoa(_mapID)
 	if err != nil {
 		return err

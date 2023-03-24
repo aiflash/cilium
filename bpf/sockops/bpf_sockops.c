@@ -1,5 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright (C) 2018-2020 Authors of Cilium */
+// SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+/* Copyright Authors of Cilium */
 
 #include <bpf/ctx/unspec.h>
 #include <bpf/api.h>
@@ -30,7 +30,7 @@ static __always_inline void sk_extract4_key(const struct bpf_sock_ops *ops,
 	key->sip4 = ops->local_ip4;
 	key->family = ENDPOINT_KEY_IPV4;
 
-	key->sport = (bpf_ntohl(ops->local_port) >> 16);
+	key->sport = (bpf_htonl(ops->local_port) >> 16);
 	/* clang-7.1 or higher seems to think it can do a 16-bit read here
 	 * which unfortunately most kernels (as of October 2019) do not
 	 * support, which leads to verifier failures. Insert a READ_ONCE
@@ -44,7 +44,7 @@ static __always_inline void sk_lb4_key(struct lb4_key *lb4,
 {
 	/* SK MSG is always egress, so use daddr */
 	lb4->address = key->dip4;
-	lb4->dport = key->dport;
+	lb4->dport = (__u16)key->dport;
 }
 
 static __always_inline bool redirect_to_proxy(int verdict)
@@ -67,7 +67,7 @@ static inline void bpf_sock_ops_ipv4(struct bpf_sock_ops *skops)
 	 * pulled in as needed.
 	 */
 	sk_lb4_key(&lb4_key, &key);
-	svc = lb4_lookup_service(&lb4_key, true);
+	svc = lb4_lookup_service(&lb4_key, true, true);
 	if (svc)
 		return;
 
@@ -75,14 +75,14 @@ static inline void bpf_sock_ops_ipv4(struct bpf_sock_ops *skops)
 	if (1) {
 		struct remote_endpoint_info *info;
 
-		info = lookup_ip4_remote_endpoint(key.dip4);
+		info = lookup_ip4_remote_endpoint(key.dip4, 0);
 		if (info != NULL && info->sec_label)
 			dst_id = info->sec_label;
 		else
 			dst_id = WORLD_ID;
 	}
 
-	verdict = policy_sk_egress(dst_id, key.sip4, key.dport);
+	verdict = policy_sk_egress(dst_id, key.sip4, (__u16)key.dport);
 	if (redirect_to_proxy(verdict)) {
 		__be32 host_ip = IPV4_GATEWAY;
 
@@ -127,7 +127,7 @@ static inline void bpf_sock_ops_ipv6(struct bpf_sock_ops *skops)
 #endif /* ENABLE_IPV6 */
 
 __section("sockops")
-int bpf_sockmap(struct bpf_sock_ops *skops)
+int cil_sockops(struct bpf_sock_ops *skops)
 {
 	__u32 family, op;
 
@@ -153,5 +153,5 @@ int bpf_sockmap(struct bpf_sock_ops *skops)
 	return 0;
 }
 
-BPF_LICENSE("GPL");
+BPF_LICENSE("Dual BSD/GPL");
 int _version __section("version") = 1;

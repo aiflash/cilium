@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2019-2020 Authors of Cilium
+// Copyright Authors of Cilium
 
 package cmd
 
@@ -8,12 +8,12 @@ import (
 	"os"
 	"reflect"
 
+	"github.com/spf13/cobra"
+
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/command"
 	"github.com/cilium/cilium/pkg/common"
 	"github.com/cilium/cilium/pkg/maps/nat"
-
-	"github.com/spf13/cobra"
 )
 
 // bpfNatListCmd represents the bpf_nat_list command
@@ -33,7 +33,7 @@ var bpfNatListCmd = &cobra.Command{
 
 func init() {
 	bpfNatCmd.AddCommand(bpfNatListCmd)
-	command.AddJSONOutput(bpfNatListCmd)
+	command.AddOutputOption(bpfNatListCmd)
 }
 
 func dumpNat(maps []interface{}, args ...interface{}) {
@@ -55,9 +55,9 @@ func dumpNat(maps []interface{}, args ...interface{}) {
 			Fatalf("Unable to open %s: %s", path, err)
 		}
 		defer m.(nat.NatMap).Close()
-		// Plain output prints immediately, JSON output holds until it
+		// Plain output prints immediately, JSON/YAML output holds until it
 		// collected values from all maps to have one consistent object
-		if command.OutputJSON() {
+		if command.OutputOption() {
 			callback := func(key bpf.MapKey, value bpf.MapValue) {
 				record := nat.NatMapRecord{Key: key.(nat.NatKey), Value: value.(nat.NatEntry)}
 				entries = append(entries, record)
@@ -73,7 +73,7 @@ func dumpNat(maps []interface{}, args ...interface{}) {
 			fmt.Println(out)
 		}
 	}
-	if command.OutputJSON() {
+	if command.OutputOption() {
 		if err := command.PrintOutput(entries); err != nil {
 			os.Exit(1)
 		}
