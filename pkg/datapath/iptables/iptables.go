@@ -279,6 +279,7 @@ type IptablesManager struct {
 	haveSocketMatch      bool
 	haveBPFSocketAssign  bool
 	ipEarlyDemuxDisabled bool
+	CNIChainingMode      string
 }
 
 // Init initializes the iptables manager and checks for iptables kernel modules
@@ -325,7 +326,7 @@ func (m *IptablesManager) Init() {
 	m.haveIp6tables = haveIp6tables
 
 	if err := modulesManager.FindOrLoadModules("xt_socket"); err != nil {
-		if option.Config.Tunnel == option.TunnelDisabled {
+		if !option.Config.TunnelingEnabled() {
 			// xt_socket module is needed to circumvent an explicit drop in ip_forward()
 			// logic for packets for which a local socket is found by ip early
 			// demux. xt_socket performs a local socket match and sets an skb mark on
@@ -376,7 +377,7 @@ func (m *IptablesManager) SupportsOriginalSourceAddr() bool {
 	// Original source address use works if xt_socket match is supported, or if ip early demux
 	// is disabled, but it is not needed when tunneling is used as the tunnel header carries
 	// the source security ID.
-	return (m.haveSocketMatch || m.ipEarlyDemuxDisabled) && option.Config.Tunnel == option.TunnelDisabled
+	return (m.haveSocketMatch || m.ipEarlyDemuxDisabled) && !option.Config.TunnelingEnabled()
 }
 
 // removeRules removes iptables rules installed by Cilium.
@@ -622,10 +623,22 @@ func (m *IptablesManager) installStaticProxyRules() error {
 			return err
 		}
 
-		// No conntrack for proxy return traffic
+		// No conntrack for proxy return traffic that is heading to cilium_host
 		if err := ip6tables.runProg([]string{
 			"-t", "raw",
 			"-A", ciliumOutputRawChain,
+			"-o", defaults.HostDevice,
+			"-m", "mark", "--mark", matchProxyReply,
+			"-m", "comment", "--comment", "cilium: NOTRACK for proxy return traffic",
+			"-j", "CT", "--notrack"}); err != nil {
+			return err
+		}
+
+		// No conntrack for proxy upstream traffic that is heading to lxc+
+		if err := ip6tables.runProg([]string{
+			"-t", "raw",
+			"-A", ciliumOutputRawChain,
+			"-o", "lxc+",
 			"-m", "mark", "--mark", matchProxyReply,
 			"-m", "comment", "--comment", "cilium: NOTRACK for proxy return traffic",
 			"-j", "CT", "--notrack"}); err != nil {
@@ -1031,11 +1044,11 @@ func (m *IptablesManager) doGetProxyPort(prog iptablesInterface, name string) ui
 	return uint16(portUInt64)
 }
 
-func getDeliveryInterface(ifName string) string {
+func (m *IptablesManager) getDeliveryInterface(ifName string) string {
 	switch {
 	case option.Config.EnableEndpointRoutes:
 		// aws-cni creates container interfaces with names like eni621c0fc8425.
-		if option.Config.CNIChainingMode == "aws-cni" {
+		if m.CNIChainingMode == "aws-cni" {
 			return "eni+"
 		}
 		return "lxc+"
@@ -1246,7 +1259,7 @@ func (m *IptablesManager) installMasqueradeRules(prog iptablesInterface, ifName,
 		return err
 	}
 
-	if option.Config.Tunnel != option.TunnelDisabled {
+	if option.Config.TunnelingEnabled() {
 		// Masquerade all traffic from the host into the ifName
 		// interface if the source is not in the node's pod CIDR.
 		//
@@ -1494,7 +1507,7 @@ func (m *IptablesManager) installRules(ifName string) error {
 		return fmt.Errorf("cannot install xfrm rules: %w", err)
 	}
 
-	localDeliveryInterface := getDeliveryInterface(ifName)
+	localDeliveryInterface := m.getDeliveryInterface(ifName)
 
 	if err := m.installForwardChainRules(ifName, localDeliveryInterface, ciliumForwardChain); err != nil {
 		return fmt.Errorf("cannot install forward chain rules to %s: %w", ciliumForwardChain, err)
@@ -1596,13 +1609,13 @@ func (m *IptablesManager) addCiliumAcceptXfrmRules() error {
 		return nil
 	}
 
-	insertAcceptXfrm := func(table, chain string) error {
+	insertAcceptXfrm := func(ipt *ipt, table, chain string) error {
 		matchFromIPSecEncrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkDecrypt, linux_defaults.RouteMarkMask)
 		matchFromIPSecDecrypt := fmt.Sprintf("%#08x/%#08x", linux_defaults.RouteMarkEncrypt, linux_defaults.RouteMarkMask)
 
 		comment := "exclude xfrm marks from " + table + " " + chain + " chain"
 
-		if err := ip4tables.runProg([]string{
+		if err := ipt.runProg([]string{
 			"-t", table,
 			"-A", chain,
 			"-m", "mark", "--mark", matchFromIPSecEncrypt,
@@ -1611,7 +1624,7 @@ func (m *IptablesManager) addCiliumAcceptXfrmRules() error {
 			return err
 		}
 
-		return ip4tables.runProg([]string{
+		return ipt.runProg([]string{
 			"-t", table,
 			"-A", chain,
 			"-m", "mark", "--mark", matchFromIPSecDecrypt,
@@ -1619,23 +1632,21 @@ func (m *IptablesManager) addCiliumAcceptXfrmRules() error {
 			"-j", "ACCEPT"})
 	}
 
-	if err := insertAcceptXfrm("filter", ciliumInputChain); err != nil {
-		return err
-	}
-	if err := insertAcceptXfrm("filter", ciliumOutputChain); err != nil {
-		return err
-	}
-	if err := insertAcceptXfrm("filter", ciliumForwardChain); err != nil {
-		return err
-	}
-	if err := insertAcceptXfrm("nat", ciliumPostNatChain); err != nil {
-		return err
-	}
-	if err := insertAcceptXfrm("nat", ciliumPreNatChain); err != nil {
-		return err
-	}
-	if err := insertAcceptXfrm("nat", ciliumOutputNatChain); err != nil {
-		return err
+	for _, chain := range ciliumChains {
+		switch chain.table {
+		case "filter", "nat":
+			if option.Config.EnableIPv4 {
+				if err := insertAcceptXfrm(ip4tables, chain.table, chain.name); err != nil {
+					return err
+				}
+			}
+			// ip6tables chain exists only if chain.ipv6 is true
+			if option.Config.EnableIPv6 && chain.ipv6 {
+				if err := insertAcceptXfrm(ip6tables, chain.table, chain.name); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }

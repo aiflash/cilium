@@ -378,6 +378,8 @@ enum DropReason {
     CT_NO_MAP_FOUND = 190;
     SNAT_NO_MAP_FOUND = 191;
     INVALID_CLUSTER_ID = 192;
+    UNSUPPORTED_PROTOCOL_FOR_DSR_ENCAP = 193;
+    NO_EGRESS_GATEWAY = 194;
 }
 
 enum TrafficDirection {

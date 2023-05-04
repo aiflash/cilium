@@ -103,21 +103,18 @@ const (
 	// from previous state automatically
 	EnableHostIPRestore = true
 
-	// DefaultMapRoot is the default path where BPFFS should be mounted
-	DefaultMapRoot = "/sys/fs/bpf"
+	// BPFFSRoot is the default path where BPFFS should be mounted
+	BPFFSRoot = "/sys/fs/bpf"
+
+	// BPFFSRootFallback is the path which is used when /sys/fs/bpf has
+	// a mount, but with the other filesystem than BPFFS.
+	BPFFSRootFallback = "/run/cilium/bpffs"
+
+	// TCGlobalsPath is the default prefix for all BPF maps.
+	TCGlobalsPath = "tc/globals"
 
 	// DefaultCgroupRoot is the default path where cilium cgroup2 should be mounted
 	DefaultCgroupRoot = "/run/cilium/cgroupv2"
-
-	// SockopsEnable controsl whether sockmap should be used
-	SockopsEnable = false
-
-	// DefaultMapRootFallback is the path which is used when /sys/fs/bpf has
-	// a mount, but with the other filesystem than BPFFS.
-	DefaultMapRootFallback = "/run/cilium/bpffs"
-
-	// DefaultMapPrefix is the default prefix for all BPF maps.
-	DefaultMapPrefix = "tc/globals"
 
 	// DNSMaxIPsPerRestoredRule defines the maximum number of IPs to maintain
 	// for each FQDN selector in endpoint's restored DNS rules.
@@ -218,6 +215,10 @@ const (
 
 	// EnableIPSec is the default value for IPSec enablement
 	EnableIPSec = false
+
+	// IPsecKeyRotationDuration is the time to wait before removing old keys when
+	// the IPsec key is changing.
+	IPsecKeyRotationDuration = 5 * time.Minute
 
 	// EncryptNode enables encrypting traffic from host networking applications
 	// which are not part of Cilium manged pods.
@@ -324,11 +325,6 @@ const (
 
 	// LoopbackIPv4 is the default address for service loopback
 	LoopbackIPv4 = "169.254.42.1"
-
-	// ForceLocalPolicyEvalAtSource is the default value for
-	// option.ForceLocalPolicyEvalAtSource. It can be enabled to provide
-	// backwards compatibility.
-	ForceLocalPolicyEvalAtSource = false
 
 	// EnableEndpointRoutes is the value for option.EnableEndpointRoutes.
 	// It is disabled by default for backwards compatibility.
@@ -460,7 +456,7 @@ const (
 	CertsDirectory = RuntimePath + "/certs"
 
 	// EnableRemoteNodeIdentity is the default value for option.EnableRemoteNodeIdentity
-	EnableRemoteNodeIdentity = false
+	EnableRemoteNodeIdentity = true
 
 	// IPAMExpiration is the timeout after which an IP subject to expiratio
 	// is being released again if no endpoint is being created in time.
@@ -505,6 +501,12 @@ const (
 
 	// EnableICMPRules enables ICMP-based rule support for Cilium Network Policies.
 	EnableICMPRules = true
+
+	// RoutingMode enables choosing between native routing mode or tunneling mode.
+	RoutingMode = "tunnel"
+
+	// TunnelProtocol is the default tunneling protocol
+	TunnelProtocol = "vxlan"
 
 	// TunnelPortVXLAN is the default VXLAN port
 	TunnelPortVXLAN = 8472

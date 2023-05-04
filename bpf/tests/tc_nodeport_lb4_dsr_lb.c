@@ -13,6 +13,7 @@
 #define ENABLE_IPV4
 #define ENABLE_NODEPORT
 #define ENABLE_DSR
+#define DSR_ENCAP_GENEVE	3
 
 #define DISABLE_LOOPBACK_LB
 
@@ -180,7 +181,7 @@ int nodeport_dsr_fwd_setup(struct __ctx_buff *ctx)
 		.ip4 = BACKEND_IP,
 	};
 	struct remote_endpoint_info cache_value = {
-		.sec_label = 112233,
+		.sec_identity = 112233,
 	};
 	map_update_elem(&IPCACHE_MAP, &cache_key, &cache_value, BPF_ANY);
 

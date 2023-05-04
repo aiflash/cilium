@@ -1,3 +1,4 @@
+AArch
 ACK
 AKS
 APIEndpoint
@@ -5,6 +6,7 @@ AdapterLimitViaAPI
 Alemayhu
 Alibaba
 Anthos
+Attestor
 Automount
 BIGTCP
 BPF
@@ -165,7 +167,9 @@ Zhou
 Zookeeper
 aarch
 admin
+adminSocketPath
 agentNotReadyTaintKey
+agentSocketPath
 aksbyocni
 alibabacloud
 allocator
@@ -199,6 +203,7 @@ autoMount
 autoProtectPortRange
 autocompletion
 autoload
+automount
 autoscaler
 awk
 aws
@@ -249,6 +254,7 @@ buildx
 busybox
 bytecode
 cBPF
+caBundle
 callee
 cancelled
 cardinality
@@ -271,6 +277,7 @@ cidr
 cidrs
 ciliumAgent
 ciliumNodeUpdateRate
+ciliumOperator
 ciliumnode
 classful
 classid
@@ -309,6 +316,7 @@ configSources
 configmap
 configs
 conformant
+connectionTimeout
 conntrack
 conntrackGCInterval
 containerRuntime
@@ -334,10 +342,12 @@ curl
 customCalls
 customConf
 daemonset
+dataStorage
 datacenter
 datagrams
 datapath
 datapathMode
+datastorage
 datastore
 datastream
 datastreams
@@ -350,6 +360,7 @@ decapsulation
 decrypt
 decrypted
 deepcopy
+delegatedClient
 deletetopic
 demux
 dependant
@@ -549,6 +560,7 @@ ingressLBAnnotationPrefixes
 ingressing
 init
 initContainer
+initContainers
 inline
 inlined
 inlines
@@ -605,6 +617,7 @@ kata
 keepDeprecatedLabels
 keepDeprecatedProbes
 keyFile
+keyType
 keyless
 keypair
 keyspace
@@ -895,6 +908,7 @@ rollOutCiliumPods
 rollOutPods
 rollout
 routable
+routingMode
 rst
 rsync
 runPath
@@ -926,6 +940,7 @@ securityContext
 selftest
 selftests
 sendmsg
+serverAddress
 serviceAccount
 serviceAccountName
 serviceAccounts
@@ -947,20 +962,18 @@ sig
 skb
 skipCNPStatusStartupClean
 skipCRDCreation
+skipKubeletVerification
 skipUnknownCGroupIDs
 skipteardown
 sleepAfterInit
 snat
 socketLB
 socketPath
-sockmap
-sockops
 sortBufferDrainTimeout
 sortBufferLenMax
 sourceContext
 spiffe
 spiffeTrustDomain
-spireAdminSocketPath
 src
 srv
 ssl
@@ -1039,8 +1052,10 @@ tracepoint
 tracepoints
 transpiling
 triaged
+trustDomain
 ttlSecondsAfterFinished
 tunnelPort
+tunnelProtocol
 tuples
 ubuntu
 udp
@@ -1068,6 +1083,7 @@ updateStrategy
 uplink
 uprobes
 upstreamed
+uptime
 uretprobes
 url
 useAPIServer

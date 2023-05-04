@@ -8,6 +8,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/cilium/cilium/pkg/auth/certs"
 	"github.com/cilium/cilium/pkg/identity"
 	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/monitor"
@@ -23,12 +24,14 @@ type authManager struct {
 // ipCache is the set of interactions the auth manager performs with the IPCache
 type ipCache interface {
 	GetHostIP(ip string) net.IP
+	AllocateNodeID(net.IP) uint16
 }
 
 // authHandler is responsible to handle authentication for a specific auth type
 type authHandler interface {
 	authenticate(*authRequest) (*authResponse, error)
 	authType() policy.AuthType
+	subscribeToRotatedIdentities() <-chan certs.CertificateRotationEvent
 }
 
 type authRequest struct {
@@ -52,7 +55,7 @@ type authResult struct {
 	ci             *monitor.ConnectionInfo
 	localIdentity  identity.NumericIdentity
 	remoteIdentity identity.NumericIdentity
-	remoteHostIP   net.IP
+	remoteNodeID   uint16
 	authType       policy.AuthType
 	expirationTime time.Time
 }
@@ -111,7 +114,7 @@ func (a *authManager) authRequired(dn *monitor.DropNotify, ci *monitor.Connectio
 		ci:             ci,
 		localIdentity:  authReq.localIdentity,
 		remoteIdentity: authReq.remoteIdentity,
-		remoteHostIP:   authReq.remoteHostIP,
+		remoteNodeID:   a.ipCache.AllocateNodeID(authReq.remoteHostIP),
 		authType:       authType,
 		expirationTime: authResp.expirationTime,
 	}

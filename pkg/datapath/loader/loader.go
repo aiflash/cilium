@@ -17,7 +17,6 @@ import (
 	"github.com/cilium/cilium/pkg/bpf"
 	"github.com/cilium/cilium/pkg/byteorder"
 	"github.com/cilium/cilium/pkg/datapath/link"
-	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/datapath/linux/route"
 	"github.com/cilium/cilium/pkg/datapath/loader/metrics"
 	datapath "github.com/cilium/cilium/pkg/datapath/types"
@@ -45,6 +44,9 @@ const (
 	symbolToHostEp         = "cil_to_host"
 
 	symbolFromHostNetdevXDP = "cil_xdp_entry"
+
+	symbolFromOverlay = "cil_from_overlay"
+	symbolToOverlay   = "cil_to_overlay"
 
 	dirIngress = "ingress"
 	dirEgress  = "egress"
@@ -90,7 +92,6 @@ func upsertEndpointRoute(ep datapath.Endpoint, ip net.IPNet) error {
 		Prefix: ip,
 		Device: ep.InterfaceName(),
 		Scope:  netlink.SCOPE_LINK,
-		Proto:  linux_defaults.RTProto,
 	}
 
 	return route.Upsert(endpointRoute)
@@ -353,6 +354,25 @@ func (l *Loader) replaceNetworkDatapath(ctx context.Context, interfaces []string
 		// Defer map removal until all interfaces' progs have been replaced.
 		defer finalize()
 	}
+	return nil
+}
+
+func (l *Loader) replaceOverlayDatapath(ctx context.Context, cArgs []string, iface string) error {
+	if err := compileOverlay(ctx, cArgs); err != nil {
+		log.WithError(err).Fatal("failed to compile overlay programs")
+	}
+
+	progs := []progDefinition{
+		{progName: symbolFromOverlay, direction: dirIngress},
+		{progName: symbolToOverlay, direction: dirEgress},
+	}
+
+	finalize, err := replaceDatapath(ctx, iface, overlayObj, progs, "")
+	if err != nil {
+		log.WithField(logfields.Interface, iface).WithError(err).Fatal("Load overlay network failed")
+	}
+	finalize()
+
 	return nil
 }
 

@@ -39,7 +39,6 @@ pipeline {
         stage('Checkout') {
             steps {
                 sh 'env'
-                Status("PENDING", "${env.JOB_NAME}")
                 checkout scm
                 sh 'mkdir -p ${PROJ_PATH}'
                 sh 'ls -A | grep -v src | xargs mv -t ${PROJ_PATH}'
@@ -60,7 +59,7 @@ pipeline {
                         env.DOCKER_TAG = env.DOCKER_TAG + "-race"
                         env.RACE = 1
                         env.LOCKDEBUG = 1
-                        env.BASE_IMAGE = "quay.io/cilium/cilium-runtime:fe3fe058796057d2a089fac72a6a7afdf6b31435@sha256:d3f15d63ba73529963a3e9b5b2ff737f5638fc7a33819ac5380e72f2af7b4642"
+                        env.BASE_IMAGE = "quay.io/cilium/cilium-runtime:b32efb0e682e74311b628df328dfd768108b92c2@sha256:0873607c0fc991c884bc7d39ea774c8ebd7df2be35f4b69b6d16b33ce871427b"
                     }
                 }
             }
@@ -101,7 +100,7 @@ pipeline {
         stage('Netperf tests'){
 
             when {
-                environment name: 'GIT_BRANCH', value: 'origin/master'
+                environment name: 'GIT_BRANCH', value: 'origin/main'
             }
 
             options {
@@ -128,12 +127,6 @@ pipeline {
             sh 'cd ${TESTDIR}; K8S_VERSION=${K8S_VERSION} vagrant destroy -f || true'
             cleanWs()
             sh '/usr/local/bin/cleanup || true'
-        }
-        success {
-            Status("SUCCESS", "$JOB_BASE_NAME")
-        }
-        failure {
-            Status("FAILURE", "$JOB_BASE_NAME")
         }
     }
 }

@@ -4,6 +4,9 @@
 package cmd
 
 import (
+	healthApi "github.com/cilium/cilium/api/v1/health/server"
+	"github.com/cilium/cilium/api/v1/server"
+	"github.com/cilium/cilium/daemon/cmd/cni"
 	"github.com/cilium/cilium/pkg/auth"
 	"github.com/cilium/cilium/pkg/bgpv1"
 	"github.com/cilium/cilium/pkg/crypto/certificatemanager"
@@ -51,6 +54,8 @@ var (
 		// Provides Clientset, API for accessing Kubernetes objects.
 		k8sClient.Cell,
 
+		cni.Cell,
+
 		// Provide option.Config via hive so cells can depend on the agent config.
 		cell.Provide(func() *option.DaemonConfig { return option.Config }),
 	)
@@ -79,6 +84,12 @@ var (
 
 		// Certificate manager provides an API for retrieving secrets and certificate in the form of TLS contexts.
 		certificatemanager.Cell,
+
+		// Cilium API specification cell makes the swagger model available for reuse
+		server.SpecCell,
+
+		// cilium-health connectivity probe API specification cell makes the swagger model available for reuse
+		healthApi.SpecCell,
 
 		// daemonCell wraps the legacy daemon initialization and provides Promise[*Daemon].
 		daemonCell,

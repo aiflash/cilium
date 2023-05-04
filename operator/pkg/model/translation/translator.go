@@ -10,9 +10,11 @@ import (
 	envoy_config_route_v3 "github.com/cilium/proxy/go/envoy/config/route/v3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/cilium/cilium/operator/pkg/model"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	"github.com/cilium/cilium/pkg/slices"
 )
 
 const (
@@ -65,6 +67,22 @@ func (i *defaultTranslator) Translate(model *model.Model) (*ciliumv2.CiliumEnvoy
 	cec.Spec.Services = i.getServices(model)
 	cec.Spec.Resources = i.getResources(model)
 
+	ownerReferences := make([]metav1.OwnerReference, 0, len(model.HTTP))
+	uniqueMap := map[string]struct{}{}
+	for _, h := range model.HTTP {
+		key := fmt.Sprintf("%s/%s/%s", h.Sources[0].Version, h.Sources[0].Kind, h.Sources[0].Name)
+		if _, exists := uniqueMap[key]; exists {
+			continue
+		}
+		uniqueMap[key] = struct{}{}
+		ownerReferences = append(ownerReferences, metav1.OwnerReference{
+			APIVersion: h.Sources[0].Version,
+			Kind:       h.Sources[0].Kind,
+			Name:       h.Sources[0].Name,
+			UID:        types.UID(h.Sources[0].UID),
+		})
+	}
+	cec.OwnerReferences = ownerReferences
 	return cec, nil, nil, nil
 }
 
@@ -153,18 +171,29 @@ func (i *defaultTranslator) getRouteConfiguration(m *model.Model) []ciliumv2.XDS
 	}
 
 	var res []ciliumv2.XDSResource
-	for port, hostNames := range portHostName {
+
+	for _, port := range []string{insecureHost, secureHost} {
+		hostNames, exists := portHostName[port]
+		if !exists {
+			continue
+		}
 		var virtualhosts []*envoy_config_route_v3.VirtualHost
 
+		redirectedHost := map[string]struct{}{}
 		// Add HTTPs redirect virtual host for secure host
 		if port == insecureHost && i.enforceHTTPs {
-			for _, h := range unique(portHostName[secureHost]) {
+			for _, h := range slices.Unique(portHostName[secureHost]) {
 				vhs, _ := NewVirtualHostWithDefaults([]string{h}, true, i.hostNameSuffixMatch, hostNameRoutes[h])
 				virtualhosts = append(virtualhosts, vhs)
+				redirectedHost[h] = struct{}{}
 			}
 		}
-
-		for _, h := range unique(hostNames) {
+		for _, h := range slices.Unique(hostNames) {
+			if port == insecureHost {
+				if _, ok := redirectedHost[h]; ok {
+					continue
+				}
+			}
 			routes, exists := hostNameRoutes[h]
 			if !exists {
 				continue
@@ -214,7 +243,7 @@ func getNamespaceNamePortsMap(m *model.Model) map[string]map[string][]string {
 			for _, be := range r.Backends {
 				namePortMap, exist := namespaceNamePortMap[be.Namespace]
 				if exist {
-					namePortMap[be.Name] = sortAndUnique(append(namePortMap[be.Name], be.Port.GetPort()))
+					namePortMap[be.Name] = slices.SortedUnique(append(namePortMap[be.Name], be.Port.GetPort()))
 				} else {
 					namePortMap = map[string][]string{
 						be.Name: {be.Port.GetPort()},
@@ -225,29 +254,4 @@ func getNamespaceNamePortsMap(m *model.Model) map[string]map[string][]string {
 		}
 	}
 	return namespaceNamePortMap
-}
-
-func sortAndUnique(arr []string) []string {
-	res := unique(arr)
-	sort.Strings(res)
-	return res
-}
-
-// unique returns a unique slice of strings. The order of the elements is
-// preserved.
-func unique(arr []string) []string {
-	m := map[string]struct{}{}
-	for _, s := range arr {
-		m[s] = struct{}{}
-	}
-
-	res := make([]string, 0, len(m))
-	for _, v := range arr {
-		if _, exists := m[v]; !exists {
-			continue
-		}
-		res = append(res, v)
-		delete(m, v)
-	}
-	return res
 }

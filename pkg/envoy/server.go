@@ -30,6 +30,7 @@ import (
 	envoy_config_tls "github.com/cilium/proxy/go/envoy/extensions/transport_sockets/tls/v3"
 	envoy_config_upstream "github.com/cilium/proxy/go/envoy/extensions/upstreams/http/v3"
 	envoy_type_matcher "github.com/cilium/proxy/go/envoy/type/matcher/v3"
+	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
@@ -740,14 +741,26 @@ func (s *XDSServer) deleteSecret(name string, wg *completion.WaitGroup, callback
 }
 
 // 'l7lb' triggers the upstream mark to embed source pod EndpointID instead of source security ID
-func getListenerFilter(isIngress bool, mayUseOriginalSourceAddr bool, l7lb bool) *envoy_config_listener.ListenerFilter {
+func getListenerFilter(isIngress bool, useOriginalSourceAddr bool, l7lb bool) *envoy_config_listener.ListenerFilter {
 	conf := &cilium.BpfMetadata{
-		IsIngress:                   isIngress,
-		MayUseOriginalSourceAddress: mayUseOriginalSourceAddr,
-		BpfRoot:                     bpf.GetMapRoot(),
-		EgressMarkSourceEndpointId:  l7lb,
+		IsIngress:                isIngress,
+		UseOriginalSourceAddress: useOriginalSourceAddr,
+		BpfRoot:                  bpf.BPFFSRoot(),
+		IsL7Lb:                   l7lb,
 	}
-	// Set Ingress source addresses if configuring for L7 LB
+	// Set Ingress source addresses if configuring for L7 LB One of these will be used when
+	// useOriginalSourceAddr is false, or when the source is known to not be from the local node
+	// (in such a case use of the original source address would lead to broken routing for the
+	// return traffic, as it would not be sent to the this node where upstream connection
+	// originates from).
+	//
+	// Note: This means that all non-local traffic will be identified by the destination to be
+	// coming from/via "Ingress", even if the listener is not an Ingress listener.
+	// We could refrain from using these ingress addresses in such cases, but then the upstream
+	// traffic would come from an (other) host IP, which is even worse.
+	//
+	// One solution to this dilemma would be to never configure these addresses if
+	// useOriginalSourceAddr is true and let such traffic fail.
 	if l7lb {
 		ingressIPv4 := node.GetIngressIPv4()
 		if ingressIPv4 != nil {
@@ -1146,7 +1159,7 @@ func getHTTPRule(secretManager certificatemanager.SecretManager, h *api.PortRule
 						HeaderMatchSpecifier: &envoy_config_route.HeaderMatcher_PresentMatch{PresentMatch: true}})
 				}
 			} else {
-				log.Debugf("HeaderMatches: Adding %s: %s", hdr.Name, value)
+				log.Debugf("HeaderMatches: Adding %s", hdr.Name)
 				headerMatches = append(headerMatches, &cilium.HeaderMatch{
 					MismatchAction: mismatch_action,
 					Name:           hdr.Name,
@@ -1556,7 +1569,7 @@ func getWildcardNetworkPolicyRule(selectors policy.L7DataMap) *cilium.PortNetwor
 	}
 }
 
-func getDirectionNetworkPolicy(ep logger.EndpointUpdater, l4Policy policy.L4PolicyMap, policyEnforced bool, vis policy.DirectionalVisibilityPolicy) []*cilium.PortNetworkPolicy {
+func getDirectionNetworkPolicy(ep logger.EndpointUpdater, l4Policy policy.L4PolicyMap, policyEnforced bool, vis policy.DirectionalVisibilityPolicy, dir string) []*cilium.PortNetworkPolicy {
 	// TODO: integrate visibility with enforced policy
 	if !policyEnforced {
 		PerPortPolicies := make([]*cilium.PortNetworkPolicy, 0, len(vis))
@@ -1616,6 +1629,13 @@ func getDirectionNetworkPolicy(ep logger.EndpointUpdater, l4Policy policy.L4Poli
 			// port-specific rules. Otherwise traffic from allowed remotes could be dropped.
 			rule := getWildcardNetworkPolicyRule(l4.PerSelectorPolicies)
 			if rule != nil {
+				log.WithFields(logrus.Fields{
+					logfields.EndpointID:       ep.GetID(),
+					logfields.TrafficDirection: dir,
+					logfields.Port:             port,
+					logfields.PolicyID:         rule.RemotePolicies,
+				}).Debug("Wildcard PortNetworkPolicyRule matching remote IDs")
+
 				if len(rule.RemotePolicies) == 0 {
 					// Got an allow-all rule, which can short-circuit all of
 					// the other rules.
@@ -1636,6 +1656,15 @@ func getDirectionNetworkPolicy(ep logger.EndpointUpdater, l4Policy policy.L4Poli
 					if !cs {
 						canShortCircuit = false
 					}
+
+					log.WithFields(logrus.Fields{
+						logfields.EndpointID:       ep.GetID(),
+						logfields.TrafficDirection: dir,
+						logfields.Port:             port,
+						logfields.PolicyID:         rule.RemotePolicies,
+						logfields.ServerNames:      rule.ServerNames,
+					}).Debug("PortNetworkPolicyRule matching remote IDs")
+
 					if len(rule.RemotePolicies) == 0 && rule.L7 == nil && rule.DownstreamTlsContext == nil && rule.UpstreamTlsContext == nil && len(rule.ServerNames) == 0 {
 						// Got an allow-all rule, which can short-circuit all of
 						// the other rules.
@@ -1689,8 +1718,8 @@ func getNetworkPolicy(ep logger.EndpointUpdater, vis *policy.VisibilityPolicy, i
 			visIngress = vis.Ingress
 			visEgress = vis.Egress
 		}
-		p.IngressPerPortPolicies = getDirectionNetworkPolicy(ep, l4Policy.Ingress, ingressPolicyEnforced, visIngress)
-		p.EgressPerPortPolicies = getDirectionNetworkPolicy(ep, l4Policy.Egress, egressPolicyEnforced, visEgress)
+		p.IngressPerPortPolicies = getDirectionNetworkPolicy(ep, l4Policy.Ingress, ingressPolicyEnforced, visIngress, "ingress")
+		p.EgressPerPortPolicies = getDirectionNetworkPolicy(ep, l4Policy.Egress, egressPolicyEnforced, visEgress, "egress")
 	}
 	return p
 }

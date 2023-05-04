@@ -127,9 +127,9 @@ Generating CRD YAML
 To simply generate the CRDs and copy them into the correct location you
 must perform two tasks:
 
-* Update the ``Makefile`` to copy your generated CRD from a ``tmp`` directory to 
-  the correct location in Cilium repository. Edit the following 
-  `location <https://github.com/cilium/cilium/blob/89ca3eddf3dae9ac5fc6c343a2cd26cf3aa405fa/Makefile#L303-L311>`__
+* Update the ``Makefile`` to edit the ``CRDS_CILIUM_V2`` or
+  ``CRDS_CILIUM_V2ALPHA1`` variable (depending on the version of your new CRD)
+  to contain the plural name of your new CRD.
 * Run ``make manifests``
 
 This will generate your Golang structs into CRD manifests and copy them
@@ -181,9 +181,6 @@ scheme.
    +
    +       // Cilium BGP Peering Policy (BGPP)
    +
-   +       // BGPPSingularName is the singular name of Cilium BGP Peering Policy
-   +       BGPPSingularName = "ciliumbgppeeringpolicy"
-   +
    +       // BGPPPluralName is the plural name of Cilium BGP Peering Policy
    +       BGPPPluralName = "ciliumbgppeeringpolicies"
    +
@@ -194,9 +191,6 @@ scheme.
    +       BGPPName = BGPPPluralName + "." + CustomResourceDefinitionGroup
    +
    +       // Cilium BGP Load Balancer IP Pool (BGPPool)
-   +
-   +       // BGPPoolSingularName is the singular name of Cilium BGP Load Balancer IP Pool
-   +       BGPPoolSingularName = "ciliumbgploadbalancerippool"
    +
    +       // BGPPoolPluralName is the plural name of Cilium BGP Load Balancer IP Pool
    +       BGPPoolPluralName = "ciliumbgploadbalancerippools"
@@ -221,10 +215,8 @@ scheme.
            metav1.AddToGroupVersion(scheme, SchemeGroupVersion)
 
 You should also bump the ``CustomResourceDefinitionSchemaVersion``
-variable in the correct ``{api_version}/register.go`` to instruct Cilium
-that new CRDs have been added to the system. For example, bump this line if
-adding a CRD to the ``v2`` group:
-`register.go <https://github.com/cilium/cilium/blob/ea9fd6f97b6e7b0d115067dc9f69ba461055530f/pkg/k8s/apis/cilium.io/v2/register.go#L21-L27>`__
+variable in ``register.go`` to instruct Cilium
+that new CRDs have been added to the system.
 
 Register With Client
 ~~~~~~~~~~~~~~~~~~~~
@@ -254,11 +246,12 @@ client.
     
     var (
    @@ -86,6 +92,7 @@ func CreateCustomResourceDefinitions(clientset apiextensionsclient.Interface) er
-                   synced.CRDResourceName(k8sconstv2.CLRPName):       createCLRPCRD,
-                   synced.CRDResourceName(k8sconstv2alpha1.CESName):  createCESCRD,
-   +               synced.CRDResourceName(k8sconstv2alpha1.BGPPName): createCESCRD,
+                   synced.CRDResourceName(k8sconstv2.CLRPName):       createCRD(CLRPCRDName, k8sconstv2.CLRPName),
+                   synced.CRDResourceName(k8sconstv2.CEGPName):       createCRD(CEGPCRDName, k8sconstv2.CEGPName),
+                   synced.CRDResourceName(k8sconstv2alpha1.CESName):  createCRD(CESCRDName, k8sconstv2alpha1.CESName),
+   +               synced.CRDResourceName(k8sconstv2alpha1.BGPPName): createCRD(BGPPCRDName, k8sconstv2alpha1.BGPPName),
            }
-           for _, r := range synced.AllCRDResourceNames() {
+           for _, r := range synced.AllCiliumCRDResourceNames() {
                    fn, ok := resourceToCreateFnMapping[r]
    @@ -127,6 +134,12 @@ var (
     
@@ -273,39 +266,6 @@ client.
     )
     
     // GetPregeneratedCRD returns the pregenerated CRD based on the requested CRD
-   @@ -286,6 +299,32 @@ func createCESCRD(clientset apiextensionsclient.Interface) error {
-           )
-    }
-    
-   +// createBGPPCRD creates and updates the CiliumBGPPeeringPolicy CRD. It should be
-   +// called on agent startup but is idempotent and safe to call again.
-   +func createBGPPCRD(clientset apiextensionsclient.Interface) error {
-   +       ciliumCRD := GetPregeneratedCRD(BGPPCRDName)
-   +
-   +       return createUpdateCRD(
-   +               clientset,
-   +               BGPPCRDName,
-   +               constructV1CRD(k8sconstv2alpha1.BGPPName, ciliumCRD),
-   +               newDefaultPoller(),
-   +       )
-   +}
-   +
-   +// createBGPPoolCRD creates and updates the CiliumLoadBalancerIPPool CRD. It should be
-   +// called on agent startup but is idempotent and safe to call again.
-   +func createBGPPoolCRD(clientset apiextensionsclient.Interface) error {
-   +       ciliumCRD := GetPregeneratedCRD(BGPPoolCRDName)
-   +
-   +       return createUpdateCRD(
-   +               clientset,
-   +               BGPPoolCRDName,
-   +               constructV1CRD(k8sconstv2alpha1.BGPPName, ciliumCRD),
-   +               newDefaultPoller(),
-   +       )
-   +}
-   +
-    // createUpdateCRD ensures the CRD object is installed into the K8s cluster. It
-    // will create or update the CRD and its validation schema as necessary. This
-    // function only accepts v1 CRD objects, and defers to its v1beta1 variant if
 
 
 ``pkg/k8s/watchers/watcher.go``

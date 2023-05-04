@@ -120,14 +120,14 @@ var (
 		"ipv4NativeRoutingCIDR":  IPv4NativeRoutingCIDR,
 		"ipv6NativeRoutingCIDR":  IPv6NativeRoutingCIDR,
 
-		"ipam.operator.clusterPoolIPv6PodCIDR": "fd02::/112",
+		"ipam.operator.clusterPoolIPv6PodCIDRList": "fd02::/112",
 	}
 
 	eksChainingHelmOverrides = map[string]string{
 		"k8s.requireIPv4PodCIDR": "false",
 		"cni.chainingMode":       "aws-cni",
 		"masquerade":             "false",
-		"tunnel":                 "disabled",
+		"routingMode":            "native",
 		"nodeinit.enabled":       "true",
 	}
 
@@ -138,7 +138,7 @@ var (
 		"ipv6.enabled":               "false",
 		"k8s.requireIPv4PodCIDR":     "false",
 		"nodeinit.enabled":           "true",
-		"tunnel":                     "disabled",
+		"routingMode":                "native",
 	}
 
 	gkeHelmOverrides = map[string]string{
@@ -158,7 +158,7 @@ var (
 
 	aksHelmOverrides = map[string]string{
 		"ipam.mode":                           "delegated-plugin",
-		"tunnel":                              "disabled",
+		"routingMode":                         "native",
 		"endpointRoutes.enabled":              "true",
 		"extraArgs":                           "{--local-router-ipv4=169.254.23.0}",
 		"k8s.requireIPv4PodCIDR":              "false",
@@ -238,7 +238,8 @@ func HelmOverride(option string) string {
 // NativeRoutingEnabled returns true when native routing is enabled for a
 // particular CNI_INTEGRATION
 func NativeRoutingEnabled() bool {
-	tunnelDisabled := HelmOverride("tunnel") == "disabled"
+	tunnelDisabled := HelmOverride("tunnel") == "disabled" ||
+		HelmOverride("routingMode") == "native"
 	gkeEnabled := HelmOverride("gke.enabled") == "true"
 	return tunnelDisabled || gkeEnabled
 }
@@ -3794,6 +3795,11 @@ func (kub *Kubectl) GetCiliumPodOnNode(label string) (string, error) {
 	return kub.getCiliumPodOnNodeByName(node)
 }
 
+// GetCiliumPodOnNodeByName returns the name of the Cilium pod that is running on node with the given name.
+func (kub *Kubectl) GetCiliumPodOnNodeByName(nodeName string) (string, error) {
+	return kub.getCiliumPodOnNodeByName(nodeName)
+}
+
 func (kub *Kubectl) validateCilium() error {
 	var g errgroup.Group
 
@@ -4322,8 +4328,18 @@ func (kub *Kubectl) HubbleObserve(pod string, args string) *CmdRes {
 
 // HubbleObserveFollow runs `hubble observe --follow --output=jsonpb <args>` on
 // the Cilium pod 'ns/pod' in the background. The process is stopped when ctx is cancelled.
-func (kub *Kubectl) HubbleObserveFollow(ctx context.Context, pod string, args string) *CmdRes {
-	return kub.ExecPodCmdBackground(ctx, CiliumNamespace, pod, "cilium-agent", fmt.Sprintf("hubble observe --follow --output=jsonpb %s", args))
+func (kub *Kubectl) HubbleObserveFollow(ctx context.Context, pod string, args string) (*CmdRes, error) {
+	hubbleRes := kub.ExecPodCmdBackground(ctx, CiliumNamespace, pod, "cilium-agent",
+		fmt.Sprintf("hubble observe --debug --follow --output=jsonpb %s", args))
+	// Wait until we see the following debug log message. This is to ensure
+	// hubble observe is fully ready before returning from HubbleObserveFollow.
+	// We only need to wait for 6s because if the Hubble client can't connect
+	// to the server after 5s, it will error out anyway.
+	err := hubbleRes.WaitUntilMatchTimeout("Sending GetFlows request", 6*time.Second)
+	if err != nil {
+		return hubbleRes, fmt.Errorf("no flows received after timeout: %w", err)
+	}
+	return hubbleRes, nil
 }
 
 // WaitForIPCacheEntry waits until the given ipAddr appears in "cilium bpf ipcache list"
@@ -4666,9 +4682,10 @@ func (kub *Kubectl) CleanupCiliumComponents() {
 			"service":            "cilium-agent hubble-metrics hubble-relay hubble-peer",
 			"secret":             "hubble-relay-client-certs hubble-server-certs hubble-ca-secret cilium-ca",
 			"resourcequota":      "cilium-resource-quota cilium-operator-resource-quota",
+			"role":               "cilium-config-agent",
 		}
 
-		crdsToDelete = synced.AllCRDResourceNames()
+		crdsToDelete = synced.AllCiliumCRDResourceNames()
 	)
 
 	wg.Add(len(resourcesToDelete))
@@ -4780,8 +4797,8 @@ func (kub *Kubectl) CiliumOptions() map[string]string {
 
 // WaitForServiceFrontend waits until the service frontend with the given ipAddr
 // appears in "cilium bpf lb list --frontends" on the given node.
-func (kub *Kubectl) WaitForServiceFrontend(node, ipAddr string) error {
-	ciliumPod, err := kub.GetCiliumPodOnNode(node)
+func (kub *Kubectl) WaitForServiceFrontend(nodeName, ipAddr string) error {
+	ciliumPod, err := kub.GetCiliumPodOnNodeByName(nodeName)
 	if err != nil {
 		return err
 	}

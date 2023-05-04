@@ -7,6 +7,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -18,6 +19,7 @@ import (
 	ipcacheTypes "github.com/cilium/cilium/pkg/ipcache/types"
 	"github.com/cilium/cilium/pkg/k8s"
 	"github.com/cilium/cilium/pkg/labels"
+	"github.com/cilium/cilium/pkg/labels/cidr"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
@@ -103,18 +105,18 @@ type IPCache struct {
 	// controllers manages the async controllers for this IPCache
 	controllers *controller.Manager
 
-	// needNamedPorts is initially 'false', but will be changd to 'true' when the
-	// clusterwide named port mappings are needed for network policy computation
-	// for the first time. This avoids the overhead of maintaining 'namedPorts' map
-	// when it is known not to be needed.
-	// Protected by 'mutex'.
-	needNamedPorts bool
+	// needNamedPorts is initially 'false', but will atomically be changed to 'true'
+	// when the clusterwide named port mappings are needed for network policy
+	// computation for the first time. This avoids the overhead of unnecessarily
+	// triggering policy updates when it is known not to be needed.
+	needNamedPorts atomic.Bool
 
 	// namedPorts is a collection of all named ports in the cluster. This is needed
 	// only if an egress policy refers to a port by name.
-	// This map is returned to users so all updates must be made into a fresh map that
-	// is then swapped in place while 'mutex' is being held.
-	namedPorts types.NamedPortMultiMap
+	// This map is returned (read-only, as a NamedPortMultiMap) to users.
+	// Therefore, all updates must be made atomically, which is guaranteed by the
+	// interface.
+	namedPorts namedPortMultiMapUpdater
 
 	cacheStatus k8s.CacheStatus
 
@@ -141,7 +143,7 @@ func NewIPCache(c *Configuration) *IPCache {
 		ipToHostIPCache:   map[string]IPKeyPair{},
 		ipToK8sMetadata:   map[string]K8sMetadata{},
 		controllers:       controller.NewManager(),
-		namedPorts:        nil,
+		namedPorts:        types.NewNamedPortMultiMap(),
 		metadata:          newMetadata(),
 		Configuration:     c,
 	}
@@ -242,33 +244,6 @@ func (ipc *IPCache) getK8sMetadata(ip string) *K8sMetadata {
 		return &k8sMeta
 	}
 	return nil
-}
-
-// updateNamedPorts accumulates named ports from all K8sMetadata entries to a single map
-func (ipc *IPCache) updateNamedPorts() (namedPortsChanged bool) {
-	if !ipc.needNamedPorts {
-		return false
-	}
-	// Collect new named Ports
-	npm := make(types.NamedPortMultiMap, len(ipc.namedPorts))
-	for _, km := range ipc.ipToK8sMetadata {
-		for name, port := range km.NamedPorts {
-			if npm[name] == nil {
-				npm[name] = make(types.PortProtoSet)
-			}
-			npm[name][port] = struct{}{}
-		}
-	}
-	namedPortsChanged = !npm.Equal(ipc.namedPorts)
-	if namedPortsChanged {
-		// swap the new map in
-		if len(npm) == 0 {
-			ipc.namedPorts = nil
-		} else {
-			ipc.namedPorts = npm
-		}
-	}
-	return namedPortsChanged
 }
 
 // Upsert adds / updates the provided IP (endpoint or CIDR prefix) and identity
@@ -445,28 +420,10 @@ func (ipc *IPCache) upsertLocked(
 		} else {
 			ipc.ipToK8sMetadata[ip] = *k8sMeta
 		}
-
-		// Update named ports, first check for deleted values
-		for k := range oldK8sMeta.NamedPorts {
-			if _, ok := newNamedPorts[k]; !ok {
-				namedPortsChanged = true
-				break
-			}
-		}
-		if !namedPortsChanged {
-			// Check for added new or changed entries
-			for k, v := range newNamedPorts {
-				if v2, ok := oldK8sMeta.NamedPorts[k]; !ok || v2 != v {
-					namedPortsChanged = true
-					break
-				}
-			}
-		}
-		if namedPortsChanged {
-			// It is possible that some other POD defines same values, check if
-			// anything changes over all the PODs.
-			namedPortsChanged = ipc.updateNamedPorts()
-		}
+		// Update the named ports reference counting, but don't cause policy
+		// updates if no policy uses named ports.
+		namedPortsChanged = ipc.namedPorts.Update(oldK8sMeta.NamedPorts, newNamedPorts)
+		namedPortsChanged = namedPortsChanged && ipc.needNamedPorts.Load()
 	}
 
 	if hostIP != nil {
@@ -511,6 +468,43 @@ func (ipc *IPCache) RemoveMetadata(prefix netip.Prefix, resource ipcacheTypes.Re
 	ipc.metadata.remove(prefix, resource, aux...)
 	ipc.metadata.Unlock()
 	ipc.metadata.enqueuePrefixUpdates(prefix)
+	ipc.TriggerLabelInjection()
+}
+
+// UpsertPrefixes inserts the prefixes into the IPCache and associates CIDR
+// labels with these prefixes, thereby making these prefixes selectable in
+// policy via local ("CIDR") identities.
+//
+// This will trigger asynchronous calculation of any datapath updates necessary
+// to implement the logic associated with the new CIDR labels.
+func (ipc *IPCache) UpsertPrefixes(prefixes []netip.Prefix, src source.Source, resource ipcacheTypes.ResourceID) {
+	ipc.metadata.Lock()
+	for _, p := range prefixes {
+		ipc.metadata.upsertLocked(p, src, resource, cidr.GetCIDRLabels(p))
+		ipc.metadata.enqueuePrefixUpdates(p)
+	}
+	ipc.metadata.Unlock()
+	ipc.TriggerLabelInjection()
+}
+
+// RemovePrefixes removes the association between the prefixes and the CIDR
+// labels corresponding to those prefixes.
+//
+// This is the reverse operation of UpsertPrefixes(). If multiple callers call
+// UpsertPrefixes() with different resources, then RemovePrefixes() will only
+// remove the association for the target resource. That is, *all* callers must
+// call RemovePrefixes() before this the these prefixes become disassociated
+// from the "CIDR" labels.
+//
+// This will trigger asynchronous calculation of any datapath updates necessary
+// to implement the logic associated with the removed CIDR labels.
+func (ipc *IPCache) RemovePrefixes(prefixes []netip.Prefix, src source.Source, resource ipcacheTypes.ResourceID) {
+	ipc.metadata.Lock()
+	for _, p := range prefixes {
+		ipc.metadata.remove(p, resource, cidr.GetCIDRLabels(p))
+		ipc.metadata.enqueuePrefixUpdates(p)
+	}
+	ipc.metadata.Unlock()
 	ipc.TriggerLabelInjection()
 }
 
@@ -658,7 +652,9 @@ func (ipc *IPCache) deleteLocked(ip string, source source.Source) (namedPortsCha
 	// Update named ports
 	namedPortsChanged = false
 	if oldK8sMeta != nil && len(oldK8sMeta.NamedPorts) > 0 {
-		namedPortsChanged = ipc.updateNamedPorts()
+		namedPortsChanged = ipc.namedPorts.Update(oldK8sMeta.NamedPorts, nil)
+		// Only trigger policy updates if named ports are used in policy.
+		namedPortsChanged = namedPortsChanged && ipc.needNamedPorts.Load()
 	}
 
 	if newHostIP != nil {
@@ -680,16 +676,20 @@ func (ipc *IPCache) deleteLocked(ip string, source source.Source) (namedPortsCha
 
 // GetNamedPorts returns a copy of the named ports map. May return nil.
 func (ipc *IPCache) GetNamedPorts() (npm types.NamedPortMultiMap) {
-	ipc.mutex.Lock()
-	if !ipc.needNamedPorts {
-		ipc.needNamedPorts = true
-		ipc.updateNamedPorts()
-	}
-	// Caller can keep using the map after the lock is released, as the map is never changed
-	// once published.
-	npm = ipc.namedPorts
-	ipc.mutex.Unlock()
-	return npm
+	// We must not acquire the IPCache mutex here, as that would establish a lock ordering of
+	// Endpoint > IPCache (as endpoint.mutex can be held while calling GetNamedPorts)
+	// Since InjectLabels requires IPCache > Endpoint, a deadlock can occur otherwise.
+
+	// needNamedPorts is initially set to 'false'. This means that we will not trigger
+	// policy updates upon changes to named ports. Once this is set to 'true' though,
+	// Upsert and Delete will start to return 'namedPortsChanged = true' if the upsert
+	// or delete changed a named port, enabling the caller to trigger a policy update.
+	// Note that at the moment, this will never be set back to false, even if no policy
+	// uses named ports anymore.
+	ipc.needNamedPorts.Store(true)
+
+	// Caller can keep using the map, operations on it are protected by its mutex.
+	return ipc.namedPorts
 }
 
 // DeleteOnMetadataMatch removes the provided IP to security identity mapping from the IPCache

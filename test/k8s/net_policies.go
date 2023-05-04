@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -265,12 +266,13 @@ var _ = SkipDescribeIf(func() bool {
 				// the app instances are running
 				By("Starting hubble observe and generating traffic which should%s redirect to proxy", not)
 				ctx, cancel := context.WithCancel(context.Background())
-				hubbleRes := kubectl.HubbleObserveFollow(
+				hubbleRes, err := kubectl.HubbleObserveFollow(
 					ctx, ciliumPod,
 					// since 0s is important here so no historic events from the
 					// buffer are shown, only follow from the current time
 					"--type l7 --since 0s",
 				)
+				Expect(err).To(BeNil(), "Failed to start hubble observe")
 
 				// clean up at the end of the test
 				defer func() {
@@ -280,7 +282,6 @@ var _ = SkipDescribeIf(func() bool {
 				}()
 
 				// Let the monitor get started since it is started in the background.
-				time.Sleep(2 * time.Second)
 				res := kubectl.ExecPodCmd(
 					namespaceForTest, appPods[helpers.App2],
 					curlCmd)
@@ -289,7 +290,7 @@ var _ = SkipDescribeIf(func() bool {
 				res.ExpectSuccess("%q cannot curl %q", appPods[helpers.App2], resource)
 
 				By("Checking that aforementioned traffic was%sredirected to the proxy", not)
-				err := hubbleRes.WaitUntilMatchFilterLineTimeout(filter, expect, hubbleTimeout)
+				err = hubbleRes.WaitUntilMatchFilterLineTimeout(filter, expect, hubbleTimeout)
 				if redirected {
 					ExpectWithOffset(1, err).To(BeNil(), "traffic was not redirected to the proxy when it should have been")
 				} else {
@@ -411,7 +412,7 @@ var _ = SkipDescribeIf(func() bool {
 			BeforeAll(func() {
 				RedeployCiliumWithMerge(kubectl, ciliumFilename, daemonCfg,
 					map[string]string{
-						"tunnel":               "disabled",
+						"routingMode":          "native",
 						"autoDirectNodeRoutes": "true",
 
 						"hostFirewall.enabled": "true",
@@ -492,7 +493,7 @@ var _ = SkipDescribeIf(func() bool {
 
 			It("connectivity is blocked after denying ingress", func() {
 				By("Running cilium monitor in the background")
-				ciliumPod, err := kubectl.GetCiliumPodOnNode(hostNodeName)
+				ciliumPod, err := kubectl.GetCiliumPodOnNodeByName(hostNodeName)
 				Expect(ciliumPod).ToNot(BeEmpty())
 				Expect(err).ToNot(HaveOccurred())
 
@@ -524,7 +525,7 @@ var _ = SkipDescribeIf(func() bool {
 				importPolicy(kubectl, testNamespace, cnpDenyIngress, "default-deny-ingress")
 
 				By("Running cilium monitor in the background")
-				ciliumPod, err := kubectl.GetCiliumPodOnNode(hostNodeName)
+				ciliumPod, err := kubectl.GetCiliumPodOnNodeByName(hostNodeName)
 				Expect(ciliumPod).ToNot(BeEmpty())
 				Expect(err).ToNot(HaveOccurred())
 
@@ -535,9 +536,17 @@ var _ = SkipDescribeIf(func() bool {
 				monitor, monitorCancel := kubectl.MonitorEndpointStart(ciliumPod, ep.ID)
 
 				By("Importing fromCIDR+toPorts policy on ingress")
-				cnpAllowIngress := helpers.ManifestGet(kubectl.BasePath(),
-					"cnp-ingress-from-cidr-to-ports.yaml")
-				importPolicy(kubectl, testNamespace, cnpAllowIngress, "ingress-from-cidr-to-ports")
+
+				originalAssignIPYAML := helpers.ManifestGet(kubectl.BasePath(), "cnp-ingress-from-cidr-to-ports.yaml")
+				res := kubectl.ExecMiddle("mktemp")
+				res.ExpectSuccess()
+				cnpAllowIngressWithIP := strings.Trim(res.Stdout(), "\n")
+				nodeIP, err := kubectl.GetNodeIPByLabel(kubectl.GetFirstNodeWithoutCiliumLabel(), false)
+				Expect(err).Should(BeNil())
+				kubectl.ExecMiddle(fmt.Sprintf("sed 's/NODE_WITHOUT_CILIUM_IP/%s/' %s > %s",
+					nodeIP, originalAssignIPYAML, cnpAllowIngressWithIP)).ExpectSuccess()
+
+				importPolicy(kubectl, testNamespace, cnpAllowIngressWithIP, "ingress-from-cidr-to-ports")
 				count := testConnectivity(backendPodIP, true)
 				defer monitorCancel()
 
@@ -573,7 +582,7 @@ var _ = SkipDescribeIf(func() bool {
 
 				It("Connectivity to hostns is blocked after denying ingress", func() {
 					By("Running cilium monitor in the background")
-					ciliumPod, err := kubectl.GetCiliumPodOnNode(hostNodeName)
+					ciliumPod, err := kubectl.GetCiliumPodOnNodeByName(hostNodeName)
 					Expect(ciliumPod).ToNot(BeEmpty())
 					Expect(err).ToNot(HaveOccurred())
 
@@ -603,7 +612,7 @@ var _ = SkipDescribeIf(func() bool {
 					importPolicy(kubectl, testNamespace, ccnpDenyHostIngress, "default-deny-host-ingress")
 
 					By("Running cilium monitor in the background")
-					ciliumPod, err := kubectl.GetCiliumPodOnNode(hostNodeName)
+					ciliumPod, err := kubectl.GetCiliumPodOnNodeByName(hostNodeName)
 					Expect(ciliumPod).ToNot(BeEmpty())
 					Expect(err).ToNot(HaveOccurred())
 
@@ -613,9 +622,16 @@ var _ = SkipDescribeIf(func() bool {
 					monitor, monitorCancel := kubectl.MonitorEndpointStart(ciliumPod, hostEpID)
 
 					By("Importing fromCIDR+toPorts host policy on ingress")
-					ccnpAllowHostIngress := helpers.ManifestGet(kubectl.BasePath(),
-						"ccnp-host-ingress-from-cidr-to-ports.yaml")
-					importPolicy(kubectl, testNamespace, ccnpAllowHostIngress, "host-ingress-from-cidr-to-ports")
+					originalCCNPAllowHostIngress := helpers.ManifestGet(kubectl.BasePath(), "ccnp-host-ingress-from-cidr-to-ports.yaml")
+					res := kubectl.ExecMiddle("mktemp")
+					res.ExpectSuccess()
+					ccnpAllowIngressWithIP := strings.Trim(res.Stdout(), "\n")
+					nodeIP, err := kubectl.GetNodeIPByLabel(kubectl.GetFirstNodeWithoutCiliumLabel(), false)
+					Expect(err).Should(BeNil())
+					kubectl.ExecMiddle(fmt.Sprintf("sed 's/NODE_WITHOUT_CILIUM_IP/%s/' %s > %s",
+						nodeIP, originalCCNPAllowHostIngress, ccnpAllowIngressWithIP)).ExpectSuccess()
+
+					importPolicy(kubectl, testNamespace, ccnpAllowIngressWithIP, "host-ingress-from-cidr-to-ports")
 
 					testConnectivity(backendPodIP, true)
 					count := testConnectivity(hostIPOfBackendPod, true)
@@ -1478,7 +1494,7 @@ var _ = SkipDescribeIf(helpers.DoesNotRunOn54OrLaterKernel,
 					// The following are needed because of
 					// https://github.com/cilium/cilium/issues/17962 &&
 					// https://github.com/cilium/cilium/issues/16197.
-					"tunnel":               "disabled",
+					"routingMode":          "native",
 					"autoDirectNodeRoutes": "true",
 					"kubeProxyReplacement": "strict",
 				})

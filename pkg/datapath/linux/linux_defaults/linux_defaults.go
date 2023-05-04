@@ -3,12 +3,6 @@
 
 package linux_defaults
 
-import (
-	"time"
-
-	"golang.org/x/sys/unix"
-)
-
 // Linux specific constants used in Linux datapath
 const (
 	// RouteTableIPSec is the default table ID to use for IPSec routing rules
@@ -63,8 +57,8 @@ const (
 	// RouterMarkNodePort
 	MaskMultinodeNodeport = 0x80
 
-	// RTProto is the default protocol we install our fib rules and routes with
-	RTProto = unix.RTPROT_KERNEL
+	// IPSecProtocolID IP protocol ID for IPSec defined in RFC4303
+	RouteProtocolIPSec = 50
 
 	// RulePriorityWireguard is the priority of the rule used for routing packets to Wireguard device for encryption
 	RulePriorityWireguard = 1
@@ -79,10 +73,6 @@ const (
 	// of endpoints. This priority is after encryption and proxy rules, and
 	// before the local table priority.
 	RulePriorityIngress = 20
-
-	// RulePriorityLocalLookup is the priority for the local lookup rule which is
-	// moved on init from 0
-	RulePriorityLocalLookup = 100
 
 	// RulePriorityEgress is the priority of the rule used for egress routing
 	// of endpoints. This priority is after the local table priority.
@@ -112,16 +102,16 @@ const (
 	// IPsecMarkMaskNodeID is the mask used for the node ID.
 	IPsecMarkMaskNodeID = 0xFFFF0000
 
+	// IPsecOldMarkMaskOut is the mask that was previously used. It can be
+	// removed in Cilium v1.15.
+	IPsecOldMarkMaskOut = 0xFF00
+
 	// IPsecMarkMask is the mask required for the IPsec SPI, node ID, and encrypt/decrypt bits
-	IPsecMarkMaskOut = 0xFF00 | IPsecMarkMaskNodeID
+	IPsecMarkMaskOut = IPsecOldMarkMaskOut | IPsecMarkMaskNodeID
 
 	// IPsecMarkMaskIn is the mask required for IPsec to lookup encrypt/decrypt bits
 	IPsecMarkMaskIn = 0x0F00
 
 	// IPsecFwdPriority is the priority of the fwd rules placed by IPsec
 	IPsecFwdPriority = 0x0B9F
-
-	// IPsecKeyDeleteDelay is the time to wait before removing old keys when
-	// the IPsec key is changing.
-	IPsecKeyDeleteDelay = 5 * time.Minute
 )

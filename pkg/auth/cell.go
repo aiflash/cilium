@@ -32,10 +32,12 @@ var Cell = cell.Module(
 	cell.ProvidePrivate(
 		// Null auth handler provides support for auth type "null" - which always succeeds.
 		newNullAuthHandler,
-		// CT map authenticator provides support to write authentication information into the eBPF conntrack map
-		newCtMapAuthenticator,
+		// Auth map authenticator provides support to write authentication information into the eBPF auth map
+		newAuthMapAuthenticator,
 		// MTLS auth handler provides support for auth type "mtls-*" - which performs mTLS authentication.
 		newMTLSAuthHandler,
+		// Always fail auth handler provides support for auth type "always-fail" - which always fails.
+		newAlwaysFailAuthHandler,
 	),
 	cell.Config(config{MeshAuthMonitorQueueSize: 1024}),
 	cell.Config(MTLSConfig{}),

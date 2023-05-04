@@ -166,7 +166,7 @@ sock4_skip_xlate(struct lb4_service *svc, __be32 address)
 
 		info = ipcache_lookup4(&IPCACHE_MAP, address,
 				       V4_CACHE_KEY_LEN, 0);
-		if (info == NULL || info->sec_label != HOST_ID)
+		if (!info || info->sec_identity != HOST_ID)
 			return true;
 	}
 
@@ -196,8 +196,8 @@ sock4_wildcard_lookup(struct lb4_key *key __maybe_unused,
 		goto wildcard_lookup;
 
 	info = ipcache_lookup4(&IPCACHE_MAP, key->address, V4_CACHE_KEY_LEN, 0);
-	if (info != NULL && (info->sec_label == HOST_ID ||
-	    (include_remote_hosts && identity_is_remote_node(info->sec_label))))
+	if (info && (info->sec_identity == HOST_ID ||
+		     (include_remote_hosts && identity_is_remote_node(info->sec_identity))))
 		goto wildcard_lookup;
 
 	return NULL;
@@ -632,12 +632,15 @@ int cil_sock4_recvmsg(struct bpf_sock_addr *ctx)
 	return SYS_PROCEED;
 }
 
+#ifdef ENABLE_SOCKET_LB_PEER
 __section("cgroup/getpeername4")
 int cil_sock4_getpeername(struct bpf_sock_addr *ctx)
 {
 	__sock4_xlate_rev(ctx, ctx);
 	return SYS_PROCEED;
 }
+#endif /* ENABLE_SOCKET_LB_PEER */
+
 #endif /* ENABLE_IPV4 */
 
 #if defined(ENABLE_IPV6) || defined(ENABLE_IPV4)
@@ -727,7 +730,7 @@ sock6_skip_xlate(struct lb6_service *svc, const union v6addr *address)
 
 		info = ipcache_lookup6(&IPCACHE_MAP, address,
 				       V6_CACHE_KEY_LEN, 0);
-		if (info == NULL || info->sec_label != HOST_ID)
+		if (!info || info->sec_identity != HOST_ID)
 			return true;
 	}
 
@@ -757,8 +760,8 @@ sock6_wildcard_lookup(struct lb6_key *key __maybe_unused,
 		goto wildcard_lookup;
 
 	info = ipcache_lookup6(&IPCACHE_MAP, &key->address, V6_CACHE_KEY_LEN, 0);
-	if (info != NULL && (info->sec_label == HOST_ID ||
-	    (include_remote_hosts && identity_is_remote_node(info->sec_label))))
+	if (info && (info->sec_identity == HOST_ID ||
+		     (include_remote_hosts && identity_is_remote_node(info->sec_identity))))
 		goto wildcard_lookup;
 
 	return NULL;
@@ -1223,12 +1226,15 @@ int cil_sock6_recvmsg(struct bpf_sock_addr *ctx)
 	return SYS_PROCEED;
 }
 
+#ifdef ENABLE_SOCKET_LB_PEER
 __section("cgroup/getpeername6")
 int cil_sock6_getpeername(struct bpf_sock_addr *ctx)
 {
 	__sock6_xlate_rev(ctx);
 	return SYS_PROCEED;
 }
+#endif /* ENABLE_SOCKET_LB_PEER */
+
 #endif /* ENABLE_IPV6 || ENABLE_IPV4 */
 
 BPF_LICENSE("Dual BSD/GPL");
