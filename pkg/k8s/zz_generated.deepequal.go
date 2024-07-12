@@ -25,6 +25,9 @@ func (in *Backend) DeepEqual(other *Backend) bool {
 	if in.NodeName != other.NodeName {
 		return false
 	}
+	if in.Hostname != other.Hostname {
+		return false
+	}
 	if in.Terminating != other.Terminating {
 		return false
 	}
@@ -46,6 +49,9 @@ func (in *Backend) DeepEqual(other *Backend) bool {
 	}
 
 	if in.Preferred != other.Preferred {
+		return false
+	}
+	if in.Zone != other.Zone {
 		return false
 	}
 
@@ -87,6 +93,18 @@ func (in *EndpointSlices) DeepEqual(other *EndpointSlices) bool {
 // receiver with other. in must be non-nil.
 func (in *Endpoints) deepEqual(other *Endpoints) bool {
 	if other == nil {
+		return false
+	}
+
+	if in.UnserializableObject != other.UnserializableObject {
+		return false
+	}
+
+	if !in.ObjectMeta.DeepEqual(&other.ObjectMeta) {
+		return false
+	}
+
+	if in.EndpointSliceID != other.EndpointSliceID {
 		return false
 	}
 
@@ -222,6 +240,27 @@ func (in *Service) deepEqual(other *Service) bool {
 					return false
 				} else {
 					if !inValue.DeepEqual(otherValue) {
+						return false
+					}
+				}
+			}
+		}
+	}
+
+	if ((in.Annotations != nil) && (other.Annotations != nil)) || ((in.Annotations == nil) != (other.Annotations == nil)) {
+		in, other := &in.Annotations, &other.Annotations
+		if other == nil {
+			return false
+		}
+
+		if len(*in) != len(*other) {
+			return false
+		} else {
+			for key, inValue := range *in {
+				if otherValue, present := (*other)[key]; !present {
+					return false
+				} else {
+					if inValue != otherValue {
 						return false
 					}
 				}

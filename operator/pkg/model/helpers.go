@@ -4,6 +4,8 @@
 package model
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"sort"
 	"strings"
 
@@ -26,7 +28,9 @@ func AddSource(sourceList []FullyQualifiedResource, source FullyQualifiedResourc
 // ComputeHosts returns a list of the intersecting hostnames between the route and the listener.
 // The below function is inspired from https://github.com/envoyproxy/gateway/blob/main/internal/gatewayapi/helpers.go.
 // Special thanks to Envoy team.
-func ComputeHosts(routeHostnames []string, listenerHostname *string) []string {
+// The function takes a list of route hostnames, a listener hostname, and a list of other listener hostnames.
+// Note that the listenerHostname value will be skipped if it is present in the otherListenerHosts list.
+func ComputeHosts(routeHostnames []string, listenerHostname *string, otherListenerHosts []string) []string {
 	var listenerHostnameVal string
 	if listenerHostname != nil {
 		listenerHostnameVal = *listenerHostname
@@ -48,9 +52,11 @@ func ComputeHosts(routeHostnames []string, listenerHostname *string) []string {
 		routeHostname := routeHostnames[i]
 
 		switch {
-		// No listener hostname: use the route hostname.
+		// No listener hostname: use the route hostname if there is no overlapping with other listener hostnames.
 		case len(listenerHostnameVal) == 0:
-			hostnames = append(hostnames, routeHostname)
+			if !checkHostNameIsolation(routeHostname, listenerHostnameVal, otherListenerHosts) {
+				hostnames = append(hostnames, routeHostname)
+			}
 
 		// Listener hostname matches the route hostname: use it.
 		case listenerHostnameVal == routeHostname:
@@ -58,7 +64,8 @@ func ComputeHosts(routeHostnames []string, listenerHostname *string) []string {
 
 		// Listener has a wildcard hostname: check if the route hostname matches.
 		case strings.HasPrefix(listenerHostnameVal, allHosts):
-			if hostnameMatchesWildcardHostname(routeHostname, listenerHostnameVal) {
+			if hostnameMatchesWildcardHostname(routeHostname, listenerHostnameVal) &&
+				!checkHostNameIsolation(routeHostname, listenerHostnameVal, otherListenerHosts) {
 				hostnames = append(hostnames, routeHostname)
 			}
 
@@ -72,6 +79,24 @@ func ComputeHosts(routeHostnames []string, listenerHostname *string) []string {
 
 	sort.Strings(hostnames)
 	return hostnames
+}
+
+func checkHostNameIsolation(routeHostname string, listenerHostName string, excludedListenerHostnames []string) bool {
+	for _, exHost := range excludedListenerHostnames {
+		if exHost == listenerHostName {
+			continue
+		}
+		if routeHostname == exHost {
+			return true
+		}
+		if strings.HasPrefix(exHost, allHosts) &&
+			hostnameMatchesWildcardHostname(routeHostname, exHost) &&
+			len(exHost) > len(listenerHostName) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // hostnameMatchesWildcardHostname returns true if hostname has the non-wildcard
@@ -88,4 +113,39 @@ func hostnameMatchesWildcardHostname(hostname, wildcardHostname string) bool {
 
 func AddressOf[T any](v T) *T {
 	return &v
+}
+
+// Shorten shortens the string to 63 characters.
+// this is the implicit required for all the resource naming in k8s.
+func Shorten(s string) string {
+	if len(s) > 63 {
+		return s[:52] + "-" + encodeHash(hash(s))
+	}
+	return s
+}
+
+// encodeHash encodes the first 10 characters of the hex string.
+// https://github.com/kubernetes/kubernetes/blob/f0dcf0614036d8c3cd1c9f3b3cf8df4bb1d8e44e/staging/src/k8s.io/kubectl/pkg/util/hash/hash.go#L105
+func encodeHash(hex string) string {
+	enc := []rune(hex[:10])
+	for i := range enc {
+		switch enc[i] {
+		case '0':
+			enc[i] = 'g'
+		case '1':
+			enc[i] = 'h'
+		case '3':
+			enc[i] = 'k'
+		case 'a':
+			enc[i] = 'm'
+		case 'e':
+			enc[i] = 't'
+		}
+	}
+	return string(enc)
+}
+
+// hash hashes `data` with sha256 and returns the hex string
+func hash(data string) string {
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(data)))
 }

@@ -8,11 +8,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
-	"time"
+	"sync/atomic"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/hive/cell"
+	"github.com/cilium/statedb"
 	"github.com/sirupsen/logrus"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,131 +27,229 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/asm"
-
+	agentK8s "github.com/cilium/cilium/daemon/k8s"
 	"github.com/cilium/cilium/pkg/annotation"
-	"github.com/cilium/cilium/pkg/bandwidth"
+	cgroup "github.com/cilium/cilium/pkg/cgroups/manager"
 	cmtypes "github.com/cilium/cilium/pkg/clustermesh/types"
-	"github.com/cilium/cilium/pkg/comparator"
 	"github.com/cilium/cilium/pkg/controller"
+	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
 	"github.com/cilium/cilium/pkg/datapath/linux/probes"
+	datapathTables "github.com/cilium/cilium/pkg/datapath/tables"
+	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/endpoint/regeneration"
-	hubblemetrics "github.com/cilium/cilium/pkg/hubble/metrics"
+	"github.com/cilium/cilium/pkg/endpointmanager"
 	"github.com/cilium/cilium/pkg/identity"
+	"github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipcache"
 	"github.com/cilium/cilium/pkg/k8s"
-	"github.com/cilium/cilium/pkg/k8s/client"
+	k8sClient "github.com/cilium/cilium/pkg/k8s/client"
 	"github.com/cilium/cilium/pkg/k8s/informer"
+	"github.com/cilium/cilium/pkg/k8s/resource"
 	slim_corev1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/api/core/v1"
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 	slimclientset "github.com/cilium/cilium/pkg/k8s/slim/k8s/client/clientset/versioned"
+	k8sSynced "github.com/cilium/cilium/pkg/k8s/synced"
 	k8sTypes "github.com/cilium/cilium/pkg/k8s/types"
 	k8sUtils "github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/k8s/watchers/resources"
+	"github.com/cilium/cilium/pkg/k8s/watchers/utils"
 	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/labels"
 	"github.com/cilium/cilium/pkg/labelsfilter"
 	"github.com/cilium/cilium/pkg/loadbalancer"
+	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
 	"github.com/cilium/cilium/pkg/metrics"
 	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/policy"
+	"github.com/cilium/cilium/pkg/redirectpolicy"
 	"github.com/cilium/cilium/pkg/service"
 	"github.com/cilium/cilium/pkg/source"
+	"github.com/cilium/cilium/pkg/time"
 	ciliumTypes "github.com/cilium/cilium/pkg/types"
 	"github.com/cilium/cilium/pkg/u8proto"
 )
 
-func (k *K8sWatcher) createPodController(slimClient slimclientset.Interface, fieldSelector fields.Selector) (cache.Store, cache.Controller) {
-	apiGroup := resources.K8sAPIGroupPodV1Core
+const podApiGroup = resources.K8sAPIGroupPodV1Core
+
+var ciliumEndpointSyncPodLabelsControllerGroup = controller.NewGroup("sync-pod-labels-with-cilium-endpoint")
+
+type k8sPodWatcherParams struct {
+	cell.In
+
+	K8sEventReporter *K8sEventReporter
+
+	Clientset         k8sClient.Clientset
+	Resources         agentK8s.Resources
+	K8sResourceSynced *k8sSynced.Resources
+	K8sAPIGroups      *k8sSynced.APIGroups
+	EndpointManager   endpointmanager.EndpointManager
+	PolicyUpdater     *policy.Updater
+	IPCache           *ipcache.IPCache
+	ServiceManager    service.ServiceManager
+	DB                *statedb.DB
+	NodeAddrs         statedb.Table[datapathTables.NodeAddress]
+	LRPManager        *redirectpolicy.Manager
+	BandwidthManager  datapath.BandwidthManager
+	CGroupManager     cgroup.CGroupManager
+}
+
+func newK8sPodWatcher(params k8sPodWatcherParams) *K8sPodWatcher {
+	return &K8sPodWatcher{
+		clientset:             params.Clientset,
+		k8sEventReporter:      params.K8sEventReporter,
+		k8sResourceSynced:     params.K8sResourceSynced,
+		k8sAPIGroups:          params.K8sAPIGroups,
+		endpointManager:       params.EndpointManager,
+		policyManager:         params.PolicyUpdater,
+		svcManager:            params.ServiceManager,
+		redirectPolicyManager: params.LRPManager,
+		ipcache:               params.IPCache,
+		cgroupManager:         params.CGroupManager,
+		bandwidthManager:      params.BandwidthManager,
+		resources:             params.Resources,
+		db:                    params.DB,
+		nodeAddrs:             params.NodeAddrs,
+
+		controllersStarted: make(chan struct{}),
+		podStoreSet:        make(chan struct{}),
+	}
+}
+
+type K8sPodWatcher struct {
+	clientset k8sClient.Clientset
+
+	k8sEventReporter *K8sEventReporter
+
+	// k8sResourceSynced maps a resource name to a channel. Once the given
+	// resource name is synchronized with k8s, the channel for which that
+	// resource name maps to is closed.
+	k8sResourceSynced *k8sSynced.Resources
+	// k8sAPIGroups is a set of k8s API in use. They are setup in watchers,
+	// and may be disabled while the agent runs.
+	k8sAPIGroups          *k8sSynced.APIGroups
+	endpointManager       endpointManager
+	policyManager         policyManager
+	svcManager            svcManager
+	redirectPolicyManager redirectPolicyManager
+	ipcache               ipcacheManager
+	cgroupManager         cgroupManager
+	bandwidthManager      datapath.BandwidthManager
+	resources             agentK8s.Resources
+	db                    *statedb.DB
+	nodeAddrs             statedb.Table[datapathTables.NodeAddress]
+
+	podStoreMU lock.RWMutex
+	podStore   cache.Store
+	// podStoreSet is a channel that is closed when the podStore cache is
+	// variable is written for the first time.
+	podStoreSet  chan struct{}
+	podStoreOnce sync.Once
+
+	// controllersStarted is a channel that is closed when all watchers that do not depend on
+	// local node configuration have been started
+	controllersStarted chan struct{}
+}
+
+// createAllPodsController is used in the rare configurations where CiliumEndpointCRD is disabled.
+// If kvstore is enabled then we fall back to watching only local pods when kvstore connects.
+func (k *K8sPodWatcher) createAllPodsController(slimClient slimclientset.Interface) (cache.Store, cache.Controller) {
 	return informer.NewInformer(
 		k8sUtils.ListerWatcherWithFields(
 			k8sUtils.ListerWatcherFromTyped[*slim_corev1.PodList](slimClient.CoreV1().Pods("")),
-			fieldSelector),
+			fields.Everything()),
 		&slim_corev1.Pod{},
 		0,
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				var valid bool
-				if pod := k8s.ObjTov1Pod(obj); pod != nil {
-					valid = true
-					podNSName := k8sUtils.GetObjNamespaceName(&pod.ObjectMeta)
-					// If ep is not nil then we have received the CNI event
-					// first and the k8s event afterwards, if this happens it's
-					// likely the Kube API Server is getting behind the event
-					// handling.
-					if ep := k.endpointManager.LookupPodName(podNSName); ep != nil {
-						epCreatedAt := ep.GetCreatedAt()
-						timeSinceEpCreated := time.Since(epCreatedAt)
-						if timeSinceEpCreated <= 0 {
-							metrics.EventLagK8s.Set(0)
-						} else {
-							metrics.EventLagK8s.Set(timeSinceEpCreated.Round(time.Second).Seconds())
-						}
-					} else {
-						// If the ep is nil then we reset to zero, otherwise
-						// the previous value set is kept forever.
-						metrics.EventLagK8s.Set(0)
-					}
+				if pod := informer.CastInformerEvent[slim_corev1.Pod](obj); pod != nil {
 					err := k.addK8sPodV1(pod)
-					k.K8sEventProcessed(metricPod, resources.MetricCreate, err == nil)
+					k.k8sEventReporter.K8sEventProcessed(metricPod, resources.MetricCreate, err == nil)
+					k.k8sEventReporter.K8sEventReceived(podApiGroup, metricPod, resources.MetricCreate, true, false)
+				} else {
+					k.k8sEventReporter.K8sEventReceived(podApiGroup, metricPod, resources.MetricCreate, false, false)
 				}
-				k.K8sEventReceived(apiGroup, metricPod, resources.MetricCreate, valid, false)
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
-				var valid, equal bool
-				if oldPod := k8s.ObjTov1Pod(oldObj); oldPod != nil {
-					if newPod := k8s.ObjTov1Pod(newObj); newPod != nil {
-						valid = true
+				if oldPod := informer.CastInformerEvent[slim_corev1.Pod](oldObj); oldPod != nil {
+					if newPod := informer.CastInformerEvent[slim_corev1.Pod](newObj); newPod != nil {
 						if oldPod.DeepEqual(newPod) {
-							equal = true
+							k.k8sEventReporter.K8sEventReceived(podApiGroup, metricPod, resources.MetricUpdate, false, true)
 						} else {
 							err := k.updateK8sPodV1(oldPod, newPod)
-							k.K8sEventProcessed(metricPod, resources.MetricUpdate, err == nil)
+							k.k8sEventReporter.K8sEventProcessed(metricPod, resources.MetricUpdate, err == nil)
+							k.k8sEventReporter.K8sEventReceived(podApiGroup, metricPod, resources.MetricUpdate, true, false)
 						}
 					}
+				} else {
+					k.k8sEventReporter.K8sEventReceived(podApiGroup, metricPod, resources.MetricUpdate, false, false)
 				}
-				k.K8sEventReceived(apiGroup, metricPod, resources.MetricUpdate, valid, equal)
 			},
 			DeleteFunc: func(obj interface{}) {
-				var valid bool
-				if pod := k8s.ObjTov1Pod(obj); pod != nil {
-					valid = true
+				if pod := informer.CastInformerEvent[slim_corev1.Pod](obj); pod != nil {
 					err := k.deleteK8sPodV1(pod)
-					k.K8sEventProcessed(metricPod, resources.MetricDelete, err == nil)
+					k.k8sEventReporter.K8sEventProcessed(metricPod, resources.MetricDelete, err == nil)
+					k.k8sEventReporter.K8sEventReceived(podApiGroup, metricPod, resources.MetricDelete, true, false)
+				} else {
+					k.k8sEventReporter.K8sEventReceived(podApiGroup, metricPod, resources.MetricDelete, false, false)
 				}
-				k.K8sEventReceived(apiGroup, metricPod, resources.MetricDelete, valid, false)
 			},
 		},
 		nil,
 	)
 }
 
-func (k *K8sWatcher) podsInit(slimClient slimclientset.Interface, asyncControllers *sync.WaitGroup) {
+func (k *K8sPodWatcher) podsInit(asyncControllers *sync.WaitGroup) {
 	var once sync.Once
-	watchNodePods := func() chan struct{} {
-		// Only watch for pod events for our node.
-		podStore, podController := k.createPodController(
-			slimClient,
-			fields.ParseSelectorOrDie("spec.nodeName="+nodeTypes.GetName()))
-		isConnected := make(chan struct{})
-		k.podStoreMU.Lock()
-		k.podStore = podStore
-		k.podStoreMU.Unlock()
-		k.podStoreOnce.Do(func() {
-			close(k.podStoreSet)
-		})
+	watchNodePods := func() context.CancelFunc {
+		ctx, cancel := context.WithCancel(context.Background())
+		var synced atomic.Bool
+		go func() {
+			pods := make(map[resource.Key]*slim_corev1.Pod)
+			for ev := range k.resources.LocalPods.Events(ctx) {
+				switch ev.Kind {
+				case resource.Sync:
+					// Set the pod store now that resource has synchronized. Only
+					// error expected is if we're being stopped (context cancelled).
+					podStore, err := k.resources.LocalPods.Store(ctx)
+					if err == nil {
+						k.podStoreMU.Lock()
+						k.podStore = podStore.CacheStore()
+						k.podStoreMU.Unlock()
+						k.podStoreOnce.Do(func() {
+							close(k.podStoreSet)
+						})
+					}
+					synced.Store(true)
+				case resource.Upsert:
+					newPod := ev.Object
+					oldPod := pods[ev.Key]
+					if oldPod == nil {
+						k.addK8sPodV1(newPod)
+					} else {
+						k.updateK8sPodV1(oldPod, newPod)
+					}
+					k.k8sResourceSynced.SetEventTimestamp(podApiGroup)
+					pods[ev.Key] = newPod
+				case resource.Delete:
+					k.deleteK8sPodV1(ev.Object)
+					k.k8sResourceSynced.SetEventTimestamp(podApiGroup)
+					delete(pods, ev.Key)
+				}
 
-		k.blockWaitGroupToSyncResources(isConnected, nil, podController.HasSynced, resources.K8sAPIGroupPodV1Core)
+				ev.Done(nil)
+			}
+		}()
+
+		k.k8sResourceSynced.BlockWaitGroupToSyncResources(ctx.Done(), nil, synced.Load, resources.K8sAPIGroupPodV1Core)
 		once.Do(func() {
 			asyncControllers.Done()
 			k.k8sAPIGroups.AddAPI(resources.K8sAPIGroupPodV1Core)
 		})
-		go podController.Run(isConnected)
-		return isConnected
+		return cancel
 	}
 
 	// We will watch for pods on th entire cluster to keep existing
@@ -157,18 +261,14 @@ func (k *K8sWatcher) podsInit(slimClient slimclientset.Interface, asyncControlle
 		return
 	}
 
-	// If CiliumEndpointCRD is disabled, we will fallback on watching all pods
-	// and then watching on the pods created for this node if the
-	// K8sEventHandover is enabled.
+	// If CiliumEndpointCRD is disabled, we will fallback on watching all pods.
 	for {
-		podStore, podController := k.createPodController(
-			slimClient,
-			fields.Everything())
+		podStore, podController := k.createAllPodsController(k.clientset.Slim())
 
 		isConnected := make(chan struct{})
 		// once isConnected is closed, it will stop waiting on caches to be
 		// synchronized.
-		k.blockWaitGroupToSyncResources(isConnected, nil, podController.HasSynced, resources.K8sAPIGroupPodV1Core)
+		k.k8sResourceSynced.BlockWaitGroupToSyncResources(isConnected, nil, podController.HasSynced, resources.K8sAPIGroupPodV1Core)
 		once.Do(func() {
 			asyncControllers.Done()
 			k.k8sAPIGroups.AddAPI(resources.K8sAPIGroupPodV1Core)
@@ -182,27 +282,25 @@ func (k *K8sWatcher) podsInit(slimClient slimclientset.Interface, asyncControlle
 			close(k.podStoreSet)
 		})
 
-		if !option.Config.K8sEventHandover {
-			return
-		}
-
 		// Replace pod controller by only receiving events from our own
 		// node once we are connected to the kvstore.
 		<-kvstore.Connected()
 		close(isConnected)
 
 		log.WithField(logfields.Node, nodeTypes.GetName()).Info("Connected to KVStore, watching for pod events on node")
-		isConnected = watchNodePods()
+		cancelWatchNodePods := watchNodePods()
 
 		// Create a new pod controller when we are disconnected with the
 		// kvstore
 		<-kvstore.Client().Disconnected()
-		close(isConnected)
+		cancelWatchNodePods()
 		log.Info("Disconnected from KVStore, watching for pod events all nodes")
 	}
 }
 
-func (k *K8sWatcher) addK8sPodV1(pod *slim_corev1.Pod) error {
+func (k *K8sPodWatcher) addK8sPodV1(pod *slim_corev1.Pod) error {
+	var err error
+
 	logger := log.WithFields(logrus.Fields{
 		logfields.K8sPodName:   pod.ObjectMeta.Name,
 		logfields.K8sNamespace: pod.ObjectMeta.Namespace,
@@ -211,6 +309,31 @@ func (k *K8sWatcher) addK8sPodV1(pod *slim_corev1.Pod) error {
 		"hostIP":               pod.Status.HostIP,
 	})
 
+	podNSName := k8sUtils.GetObjNamespaceName(&pod.ObjectMeta)
+
+	// If ep is not nil then we have received the CNI event
+	// first and the k8s event afterwards, if this happens it's
+	// likely the Kube API Server is getting behind the event
+	// handling.
+	if eps := k.endpointManager.GetEndpointsByPodName(podNSName); len(eps) != 0 {
+		var earliestEP time.Time
+		for _, ep := range eps {
+			createdAt := ep.GetCreatedAt()
+			if earliestEP.IsZero() || createdAt.Before(earliestEP) {
+				earliestEP = createdAt
+			}
+		}
+		timeSinceEpCreated := time.Since(earliestEP)
+		if timeSinceEpCreated <= 0 {
+			metrics.EventLagK8s.Set(0)
+		} else {
+			metrics.EventLagK8s.Set(timeSinceEpCreated.Round(time.Second).Seconds())
+		}
+	} else {
+		// If the ep is nil then we reset to zero, otherwise
+		// the previous value set is kept forever.
+		metrics.EventLagK8s.Set(0)
+	}
 	// In Kubernetes Jobs, Pods can be left in Kubernetes until the Job
 	// is deleted. If the Job is never deleted, Cilium will never receive a Pod
 	// delete event, causing the IP to be left in the ipcache.
@@ -218,15 +341,15 @@ func (k *K8sWatcher) addK8sPodV1(pod *slim_corev1.Pod) error {
 	// status is either PodFailed or PodSucceeded as it means the IP address
 	// is no longer in use.
 	if !k8sUtils.IsPodRunning(pod.Status) {
-		return k.deleteK8sPodV1(pod)
+		err = k.deleteK8sPodV1(pod)
+		return err
 	}
 
 	if pod.Spec.HostNetwork && !option.Config.EnableLocalRedirectPolicy {
 		logger.Debug("Skip pod event using host networking")
-		return nil
+		return err
 	}
 
-	var err error
 	podIPs := k8sUtils.ValidIPs(pod.Status)
 	if len(podIPs) > 0 {
 		err = k.updatePodHostData(nil, pod, nil, podIPs)
@@ -240,15 +363,17 @@ func (k *K8sWatcher) addK8sPodV1(pod *slim_corev1.Pod) error {
 
 	if err != nil {
 		logger.WithError(err).Warning("Unable to update ipcache map entry on pod add")
-		return err
 	}
 	logger.Debug("Updated ipcache map entry on pod add")
-	return nil
+
+	return err
 }
 
-func (k *K8sWatcher) updateK8sPodV1(oldK8sPod, newK8sPod *slim_corev1.Pod) error {
+func (k *K8sPodWatcher) updateK8sPodV1(oldK8sPod, newK8sPod *slim_corev1.Pod) error {
+	var err error
+
 	if oldK8sPod == nil || newK8sPod == nil {
-		return nil
+		return err
 	}
 
 	logger := log.WithFields(logrus.Fields{
@@ -269,24 +394,25 @@ func (k *K8sWatcher) updateK8sPodV1(oldK8sPod, newK8sPod *slim_corev1.Pod) error
 	// status is either PodFailed or PodSucceeded as it means the IP address
 	// is no longer in use.
 	if !k8sUtils.IsPodRunning(newK8sPod.Status) {
-		return k.deleteK8sPodV1(newK8sPod)
+		err = k.deleteK8sPodV1(newK8sPod)
+		return err
 	}
 
 	if newK8sPod.Spec.HostNetwork && !option.Config.EnableLocalRedirectPolicy &&
 		!option.Config.EnableSocketLBTracing {
 		logger.Debug("Skip pod event using host networking")
-		return nil
+		return err
 	}
 
 	k.cgroupManager.OnUpdatePod(oldK8sPod, newK8sPod)
 
 	oldPodIPs := k8sUtils.ValidIPs(oldK8sPod.Status)
 	newPodIPs := k8sUtils.ValidIPs(newK8sPod.Status)
-	err := k.updatePodHostData(oldK8sPod, newK8sPod, oldPodIPs, newPodIPs)
-
-	if err != nil {
-		logger.WithError(err).Warning("Unable to update ipcache map entry on pod update")
-		return err
+	if len(oldPodIPs) != 0 || len(newPodIPs) != 0 {
+		err = k.updatePodHostData(oldK8sPod, newK8sPod, oldPodIPs, newPodIPs)
+		if err != nil {
+			logger.WithError(err).Warning("Unable to update ipcache map entry on pod update")
+		}
 	}
 
 	// Check annotation updates.
@@ -299,25 +425,22 @@ func (k *K8sWatcher) updateK8sPodV1(oldK8sPod, newK8sPod *slim_corev1.Pod) error
 
 	// Check label updates too.
 	oldK8sPodLabels, _ := labelsfilter.Filter(labels.Map2Labels(oldK8sPod.ObjectMeta.Labels, labels.LabelSourceK8s))
-	oldPodLabels := oldK8sPodLabels.K8sStringMap()
-	newK8sPodLabels, _ := labelsfilter.Filter(labels.Map2Labels(newK8sPod.ObjectMeta.Labels, labels.LabelSourceK8s))
-	newPodLabels := newK8sPodLabels.K8sStringMap()
-	labelsChanged := !comparator.MapStringEquals(oldPodLabels, newPodLabels)
+	// old labels are stripped to avoid grandfathering in special labels
+	oldPodLabels := k8sUtils.StripPodSpecialLabels(oldK8sPodLabels.K8sStringMap())
 
-	lrpNeedsReassign := false
+	strippedNewLabels := k8sUtils.StripPodSpecialLabels(newK8sPod.Labels)
+
+	newK8sPodLabels, _ := labelsfilter.Filter(labels.Map2Labels(strippedNewLabels, labels.LabelSourceK8s))
+	newPodLabels := newK8sPodLabels.K8sStringMap()
+	labelsChanged := !maps.Equal(oldPodLabels, newPodLabels)
+	uidChanged := oldK8sPod.UID != newK8sPod.UID
+
 	// The relevant updates are : podIPs and label updates.
-	oldPodIPLen := len(oldK8sPod.Status.PodIP)
-	newPodIPLen := len(newK8sPod.Status.PodIP)
-	switch {
-	case oldPodIPLen == 0 && newPodIPLen > 0:
-		// PodIPs assigned update
-		fallthrough
-	case oldPodIPLen > 0 && newPodIPLen > 0 && oldPodIPLen != newPodIPLen:
-		// PodIPs update
-		fallthrough
-	case labelsChanged:
-		lrpNeedsReassign = true
-	}
+	// Consider a UID change the same as a label change in case the pod's
+	// identity needs to be updated, see GH-30409.
+	oldPodIPsSlice := k8sTypes.IPSlice(oldPodIPs)
+	newPodIPsSlice := k8sTypes.IPSlice(newPodIPs)
+	lrpNeedsReassign := !maps.Equal(oldPodLabels, newPodLabels) || !(&oldPodIPsSlice).DeepEqual(&newPodIPsSlice) || uidChanged
 
 	if option.Config.EnableLocalRedirectPolicy {
 		oldPodReady := k8sUtils.GetLatestPodReadiness(oldK8sPod.Status)
@@ -330,60 +453,78 @@ func (k *K8sWatcher) updateK8sPodV1(oldK8sPod, newK8sPod *slim_corev1.Pod) error
 
 	// Nothing changed.
 	if !annotationsChanged && !labelsChanged {
-		return nil
+		log.WithFields(logrus.Fields{
+			"old-labels":      oldK8sPod.GetObjectMeta().GetLabels(),
+			"old-annotations": oldK8sPod.GetObjectMeta().GetAnnotations(),
+			"new-labels":      newK8sPod.GetObjectMeta().GetLabels(),
+			"new-annotations": newK8sPod.GetObjectMeta().GetAnnotations(),
+		}).Debugf("Pod does not have any annotations nor labels changed")
+		return err
 	}
 
 	podNSName := k8sUtils.GetObjNamespaceName(&newK8sPod.ObjectMeta)
 
-	podEP := k.endpointManager.LookupPodName(podNSName)
-	if podEP == nil {
+	podEPs := k.endpointManager.GetEndpointsByPodName(podNSName)
+	if len(podEPs) == 0 {
 		log.WithField("pod", podNSName).Debugf("Endpoint not found running for the given pod")
-		return nil
+		return err
 	}
 
-	if labelsChanged {
-		err := updateEndpointLabels(podEP, oldPodLabels, newPodLabels)
-		if err != nil {
-			return err
+	for _, podEP := range podEPs {
+		if labelsChanged || uidChanged {
+			// Consider a UID change the same as a label change in case the pod's
+			// identity needs to be updated, see GH-30409. Annotations are not
+			// checked for because annotations don't impact identities.
+			err := podEP.UpdateLabelsFrom(oldPodLabels, newPodLabels, labels.LabelSourceK8s)
+			if err != nil {
+				log.WithFields(logrus.Fields{
+					logfields.K8sPodName:   newK8sPod.ObjectMeta.Name,
+					logfields.K8sNamespace: newK8sPod.ObjectMeta.Namespace,
+					logfields.EndpointID:   podEP.GetID(),
+					logfields.Labels:       newPodLabels,
+				}).WithError(err).Warning("Unable to update endpoint labels on pod update")
+				return err
+			}
+
+			// Synchronize Pod labels with CiliumEndpoint labels if there is a change.
+			updateCiliumEndpointLabels(k.clientset, podEP, newK8sPod.Labels)
 		}
 
-		// Synchronize Pod labels with CiliumEndpoint labels if there is a change.
-		updateCiliumEndpointLabels(k.clientset, podEP, newPodLabels)
+		if annotationsChanged {
+			if annoChangedProxy {
+				podEP.UpdateVisibilityPolicy(func(ns, podName string) (proxyVisibility string, err error) {
+					p, err := k.GetCachedPod(ns, podName)
+					if err != nil {
+						return "", nil
+					}
+					value, _ := annotation.Get(p, annotation.ProxyVisibility, annotation.ProxyVisibilityAlias)
+					return value, nil
+				})
+			}
+			if annoChangedBandwidth {
+				podEP.UpdateBandwidthPolicy(k.bandwidthManager, func(ns, podName string) (bandwidthEgress string, err error) {
+					p, err := k.GetCachedPod(ns, podName)
+					if err != nil {
+						return "", nil
+					}
+					return p.ObjectMeta.Annotations[bandwidth.EgressBandwidth], nil
+				})
+			}
+			if annoChangedNoTrack {
+				podEP.UpdateNoTrackRules(func(ns, podName string) (noTrackPort string, err error) {
+					p, err := k.GetCachedPod(ns, podName)
+					if err != nil {
+						return "", nil
+					}
+					value, _ := annotation.Get(p, annotation.NoTrack, annotation.NoTrackAlias)
+					return value, nil
+				})
+			}
+			realizePodAnnotationUpdate(podEP)
+		}
 	}
 
-	if annotationsChanged {
-		if annoChangedProxy {
-			podEP.UpdateVisibilityPolicy(func(ns, podName string) (proxyVisibility string, err error) {
-				p, err := k.GetCachedPod(ns, podName)
-				if err != nil {
-					return "", nil
-				}
-				value, _ := annotation.Get(p, annotation.ProxyVisibility, annotation.ProxyVisibilityAlias)
-				return value, nil
-			})
-		}
-		if annoChangedBandwidth {
-			podEP.UpdateBandwidthPolicy(func(ns, podName string) (bandwidthEgress string, err error) {
-				p, err := k.GetCachedPod(ns, podName)
-				if err != nil {
-					return "", nil
-				}
-				return p.ObjectMeta.Annotations[bandwidth.EgressBandwidth], nil
-			})
-		}
-		if annoChangedNoTrack {
-			podEP.UpdateNoTrackRules(func(ns, podName string) (noTrackPort string, err error) {
-				p, err := k.GetCachedPod(ns, podName)
-				if err != nil {
-					return "", nil
-				}
-				value, _ := annotation.Get(p, annotation.NoTrack, annotation.NoTrackAlias)
-				return value, nil
-			})
-		}
-		realizePodAnnotationUpdate(podEP)
-	}
-	return nil
+	return err
 }
 
 func realizePodAnnotationUpdate(podEP *endpoint.Endpoint) {
@@ -402,7 +543,7 @@ func realizePodAnnotationUpdate(podEP *endpoint.Endpoint) {
 
 // updateCiliumEndpointLabels runs a controller associated with the endpoint that updates
 // the Labels in CiliumEndpoint object by mirroring those of the associated Pod.
-func updateCiliumEndpointLabels(clientset client.Clientset, ep *endpoint.Endpoint, labels map[string]string) {
+func updateCiliumEndpointLabels(clientset k8sClient.Clientset, ep *endpoint.Endpoint, labels map[string]string) {
 	var (
 		controllerName = fmt.Sprintf("sync-pod-labels-with-cilium-endpoint (%v)", ep.GetID())
 		scopedLog      = log.WithField("controller", controllerName)
@@ -412,9 +553,10 @@ func updateCiliumEndpointLabels(clientset client.Clientset, ep *endpoint.Endpoin
 	// This is to make sure that the controller is also deleted once the endpoint is gone.
 	ep.UpdateController(controllerName,
 		controller.ControllerParams{
+			Group: ciliumEndpointSyncPodLabelsControllerGroup,
 			DoFunc: func(ctx context.Context) (err error) {
-				pod := ep.GetPod()
-				if pod == nil {
+				cepOwner := ep.GetCEPOwner()
+				if cepOwner.IsNil() {
 					err := errors.New("Skipping CiliumEndpoint update because it has no k8s pod")
 					scopedLog.WithFields(logrus.Fields{
 						logfields.EndpointID: ep.GetID(),
@@ -438,8 +580,8 @@ func updateCiliumEndpointLabels(clientset client.Clientset, ep *endpoint.Endpoin
 					return err
 				}
 
-				_, err = ciliumClient.CiliumEndpoints(pod.GetNamespace()).Patch(
-					ctx, pod.GetName(),
+				_, err = ciliumClient.CiliumEndpoints(cepOwner.GetNamespace()).Patch(
+					ctx, ep.GetK8sCEPName(),
 					types.JSONPatchType,
 					labelsPatch,
 					meta_v1.PatchOptions{})
@@ -458,11 +600,9 @@ func updateCiliumEndpointLabels(clientset client.Clientset, ep *endpoint.Endpoin
 		})
 }
 
-func updateEndpointLabels(ep *endpoint.Endpoint, oldLbls, newLbls map[string]string) error {
-	return ep.UpdateLabelsFrom(oldLbls, newLbls, labels.LabelSourceK8s)
-}
+func (k *K8sPodWatcher) deleteK8sPodV1(pod *slim_corev1.Pod) error {
+	var err error
 
-func (k *K8sWatcher) deleteK8sPodV1(pod *slim_corev1.Pod) error {
 	logger := log.WithFields(logrus.Fields{
 		logfields.K8sPodName:   pod.ObjectMeta.Name,
 		logfields.K8sNamespace: pod.ObjectMeta.Namespace,
@@ -474,7 +614,6 @@ func (k *K8sWatcher) deleteK8sPodV1(pod *slim_corev1.Pod) error {
 	if option.Config.EnableLocalRedirectPolicy {
 		k.redirectPolicyManager.OnDeletePod(pod)
 	}
-	hubblemetrics.ProcessPodDeletion(pod)
 
 	k.cgroupManager.OnDeletePod(pod)
 
@@ -503,7 +642,7 @@ func netnsCookieSupported() bool {
 	return _netnsCookieSupported
 }
 
-func (k *K8sWatcher) genServiceMappings(pod *slim_corev1.Pod, podIPs []string, logger *logrus.Entry) []loadbalancer.SVC {
+func (k *K8sPodWatcher) genServiceMappings(pod *slim_corev1.Pod, podIPs []string, logger *logrus.Entry) []loadbalancer.SVC {
 	var (
 		svcs       []loadbalancer.SVC
 		containers []slim_corev1.Container
@@ -554,7 +693,7 @@ func (k *K8sWatcher) genServiceMappings(pod *slim_corev1.Pod, podIPs []string, l
 				}
 			}
 
-			var nodeAddrAll [][]net.IP
+			var nodeAddrAll []netip.Addr
 			loopbackHostport := false
 
 			// When HostIP is explicitly set, then we need to expose *only*
@@ -573,57 +712,55 @@ func (k *K8sWatcher) genServiceMappings(pod *slim_corev1.Pod, podIPs []string, l
 					}
 					loopbackHostport = true
 				}
-				nodeAddrAll = [][]net.IP{
-					{feIP},
-				}
+				nodeAddrAll = []netip.Addr{ip.MustAddrFromIP(feIP)}
 			} else {
-				nodeAddrAll = [][]net.IP{
-					k.K8sSvcCache.GetNodeAddressing().IPv4().LoadBalancerNodeAddresses(),
-					k.K8sSvcCache.GetNodeAddressing().IPv6().LoadBalancerNodeAddresses(),
+				iter := k.nodeAddrs.List(k.db.ReadTxn(), datapathTables.NodeAddressNodePortIndex.Query(true))
+				for addr, _, ok := iter.Next(); ok; addr, _, ok = iter.Next() {
+					nodeAddrAll = append(nodeAddrAll, addr.Addr)
 				}
+				nodeAddrAll = append(nodeAddrAll, netip.IPv4Unspecified())
+				nodeAddrAll = append(nodeAddrAll, netip.IPv6Unspecified())
 			}
-			for _, addrs := range nodeAddrAll {
-				for _, ip := range addrs {
-					fe := loadbalancer.L3n4AddrID{
-						L3n4Addr: loadbalancer.L3n4Addr{
-							AddrCluster: cmtypes.MustParseAddrCluster(ip.String()),
-							L4Addr: loadbalancer.L4Addr{
-								Protocol: proto,
-								Port:     uint16(p.HostPort),
-							},
-							Scope: loadbalancer.ScopeExternal,
+			for _, addr := range nodeAddrAll {
+				fe := loadbalancer.L3n4AddrID{
+					L3n4Addr: loadbalancer.L3n4Addr{
+						AddrCluster: cmtypes.AddrClusterFrom(addr, 0),
+						L4Addr: loadbalancer.L4Addr{
+							Protocol: proto,
+							Port:     uint16(p.HostPort),
 						},
-						ID: loadbalancer.ID(0),
-					}
+						Scope: loadbalancer.ScopeExternal,
+					},
+					ID: loadbalancer.ID(0),
+				}
 
-					// We don't have the node name available here, but in any
-					// case in the BPF data path we drop any potential non-local
-					// backends anyway (which should never exist in the first
-					// place), hence we can just leave it at Cluster policy.
-					if ip.To4() != nil {
-						if option.Config.EnableIPv4 && len(bes4) > 0 {
-							svcs = append(svcs,
-								loadbalancer.SVC{
-									Frontend:         fe,
-									Backends:         bes4,
-									Type:             loadbalancer.SVCTypeHostPort,
-									ExtTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
-									IntTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
-									LoopbackHostport: loopbackHostport,
-								})
-						}
-					} else {
-						if option.Config.EnableIPv6 && len(bes6) > 0 {
-							svcs = append(svcs,
-								loadbalancer.SVC{
-									Frontend:         fe,
-									Backends:         bes6,
-									Type:             loadbalancer.SVCTypeHostPort,
-									ExtTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
-									IntTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
-									LoopbackHostport: loopbackHostport,
-								})
-						}
+				// We don't have the node name available here, but in any
+				// case in the BPF data path we drop any potential non-local
+				// backends anyway (which should never exist in the first
+				// place), hence we can just leave it at Cluster policy.
+				if addr.Is4() {
+					if option.Config.EnableIPv4 && len(bes4) > 0 {
+						svcs = append(svcs,
+							loadbalancer.SVC{
+								Frontend:         fe,
+								Backends:         bes4,
+								Type:             loadbalancer.SVCTypeHostPort,
+								ExtTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+								IntTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+								LoopbackHostport: loopbackHostport,
+							})
+					}
+				} else {
+					if option.Config.EnableIPv6 && len(bes6) > 0 {
+						svcs = append(svcs,
+							loadbalancer.SVC{
+								Frontend:         fe,
+								Backends:         bes6,
+								Type:             loadbalancer.SVCTypeHostPort,
+								ExtTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+								IntTrafficPolicy: loadbalancer.SVCTrafficPolicyCluster,
+								LoopbackHostport: loopbackHostport,
+							})
 					}
 				}
 			}
@@ -633,7 +770,7 @@ func (k *K8sWatcher) genServiceMappings(pod *slim_corev1.Pod, podIPs []string, l
 	return svcs
 }
 
-func (k *K8sWatcher) upsertHostPortMapping(oldPod, newPod *slim_corev1.Pod, oldPodIPs, newPodIPs []string) error {
+func (k *K8sPodWatcher) upsertHostPortMapping(oldPod, newPod *slim_corev1.Pod, oldPodIPs, newPodIPs []string) error {
 	if !option.Config.EnableHostPort {
 		return nil
 	}
@@ -709,7 +846,7 @@ func (k *K8sWatcher) upsertHostPortMapping(oldPod, newPod *slim_corev1.Pod, oldP
 	return nil
 }
 
-func (k *K8sWatcher) deleteHostPortMapping(pod *slim_corev1.Pod, podIPs []string) error {
+func (k *K8sPodWatcher) deleteHostPortMapping(pod *slim_corev1.Pod, podIPs []string) error {
 	if !option.Config.EnableHostPort {
 		return nil
 	}
@@ -727,6 +864,17 @@ func (k *K8sWatcher) deleteHostPortMapping(pod *slim_corev1.Pod, podIPs []string
 	}
 
 	for _, dpSvc := range svcs {
+		svc, _ := k.svcManager.GetDeepCopyServiceByFrontend(dpSvc.Frontend.L3n4Addr)
+		// Check whether the service being deleted is in fact "owned" by the pod being deleted.
+		// We want to make sure that the pod being deleted is in fact the "current" backend that
+		// "owns" the hostPort service. Otherwise we might break hostPort connectivity for another
+		// pod which may have since claimed ownership for the same hostPort service, which was previously
+		// "owned" by the pod being deleted.
+		// See: https://github.com/cilium/cilium/issues/22460.
+		if svc != nil && !utils.DeepEqualBackends(svc.Backends, dpSvc.Backends) {
+			continue
+		}
+
 		if _, err := k.svcManager.DeleteService(dpSvc.Frontend.L3n4Addr); err != nil {
 			logger.WithError(err).Error("Error while deleting service in LB map")
 			return err
@@ -736,12 +884,13 @@ func (k *K8sWatcher) deleteHostPortMapping(pod *slim_corev1.Pod, podIPs []string
 	return nil
 }
 
-func (k *K8sWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPodIPs, newPodIPs k8sTypes.IPSlice) error {
+func (k *K8sPodWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPodIPs, newPodIPs k8sTypes.IPSlice) error {
+	logger := log.WithFields(logrus.Fields{
+		logfields.K8sPodName:   newPod.ObjectMeta.Name,
+		logfields.K8sNamespace: newPod.ObjectMeta.Namespace,
+	})
+
 	if newPod.Spec.HostNetwork {
-		logger := log.WithFields(logrus.Fields{
-			logfields.K8sPodName:   newPod.ObjectMeta.Name,
-			logfields.K8sNamespace: newPod.ObjectMeta.Namespace,
-		})
 		logger.Debug("Pod is using host networking")
 		return nil
 	}
@@ -800,7 +949,7 @@ func (k *K8sWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPodIP
 		return fmt.Errorf("no/invalid HostIP: %s", newPod.Status.HostIP)
 	}
 
-	hostKey := node.GetIPsecKeyIdentity()
+	hostKey := node.GetEndpointEncryptKeyIndex()
 
 	k8sMeta := &ipcache.K8sMetadata{
 		Namespace: newPod.Namespace,
@@ -816,9 +965,6 @@ func (k *K8sWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPodIP
 			p, err := u8proto.ParseProtocol(string(port.Protocol))
 			if err != nil {
 				return fmt.Errorf("ContainerPort: invalid protocol: %s", port.Protocol)
-			}
-			if port.ContainerPort < 1 || port.ContainerPort > 65535 {
-				return fmt.Errorf("ContainerPort: invalid port: %d", port.ContainerPort)
 			}
 			if k8sMeta.NamedPorts == nil {
 				k8sMeta.NamedPorts = make(ciliumTypes.NamedPortMap)
@@ -871,7 +1017,7 @@ func (k *K8sWatcher) updatePodHostData(oldPod, newPod *slim_corev1.Pod, oldPodIP
 	return nil
 }
 
-func (k *K8sWatcher) deletePodHostData(pod *slim_corev1.Pod) (bool, error) {
+func (k *K8sPodWatcher) deletePodHostData(pod *slim_corev1.Pod) (bool, error) {
 	if pod.Spec.HostNetwork {
 		return true, fmt.Errorf("pod is using host networking")
 	}
@@ -915,15 +1061,10 @@ func (k *K8sWatcher) deletePodHostData(pod *slim_corev1.Pod) (bool, error) {
 	return skipped, nil
 }
 
-// GetCachedPod returns a pod from the local store. Depending if the Cilium
-// agent flag `option.Config.K8sEventHandover` this function might only return
-// local pods.
-// If `option.Config.K8sEventHandover` is:
-//   - true: returns only local pods received by the pod watcher.
-//   - false: returns any pod in the cluster received by the pod watcher.
-func (k *K8sWatcher) GetCachedPod(namespace, name string) (*slim_corev1.Pod, error) {
+// GetCachedPod returns a pod from the local store.
+func (k *K8sPodWatcher) GetCachedPod(namespace, name string) (*slim_corev1.Pod, error) {
 	<-k.controllersStarted
-	k.WaitForCacheSync(resources.K8sAPIGroupPodV1Core)
+	k.k8sResourceSynced.WaitForCacheSync(resources.K8sAPIGroupPodV1Core)
 	<-k.podStoreSet
 	k.podStoreMU.RLock()
 	defer k.podStoreMU.RUnlock()

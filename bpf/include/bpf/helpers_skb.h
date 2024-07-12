@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __BPF_HELPERS_SKB__
-#define __BPF_HELPERS_SKB__
+#pragma once
 
 #include <linux/bpf.h>
 
@@ -17,6 +16,7 @@ static int BPF_FUNC(redirect, int ifindex, __u32 flags);
 static int BPF_FUNC(redirect_neigh, int ifindex, struct bpf_redir_neigh *params,
 		    int plen, __u32 flags);
 static int BPF_FUNC(redirect_peer, int ifindex, __u32 flags);
+static int BPF_FUNC(clone_redirect, struct __sk_buff *skb, __u32 ifindex, __u64 flags);
 
 /* Packet manipulation */
 static int BPF_FUNC(skb_load_bytes, struct __sk_buff *skb, __u32 off,
@@ -65,5 +65,3 @@ static struct bpf_sock *BPF_FUNC(skc_lookup_tcp, struct __sk_buff *skb,
 static int BPF_FUNC(sk_release, struct bpf_sock *sk);
 static int BPF_FUNC(sk_assign, struct __sk_buff *skb, struct bpf_sock *sk,
 		    __u64 flags);
-
-#endif /* __BPF_HELPERS_SKB__ */

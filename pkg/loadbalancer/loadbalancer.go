@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/cilium/cilium/api/v1/models"
@@ -66,6 +67,7 @@ const (
 	serviceFlagLoopback        = 1 << 11
 	serviceFlagIntLocalScope   = 1 << 12
 	serviceFlagTwoScopes       = 1 << 13
+	serviceFlagQuarantined     = 1 << 14
 )
 
 type SvcFlagParam struct {
@@ -78,6 +80,7 @@ type SvcFlagParam struct {
 	CheckSourceRange bool
 	L7LoadBalancer   bool
 	LoopbackHostport bool
+	Quarantined      bool
 }
 
 // NewSvcFlag creates service flag
@@ -128,6 +131,9 @@ func NewSvcFlag(p *SvcFlagParam) ServiceFlags {
 	if p.SvcExtLocal != p.SvcIntLocal && p.SvcType != SVCTypeClusterIP {
 		flags |= serviceFlagTwoScopes
 	}
+	if p.Quarantined {
+		flags |= serviceFlagQuarantined
+	}
 
 	return flags
 }
@@ -148,6 +154,10 @@ func (s ServiceFlags) SVCType() SVCType {
 	default:
 		return SVCTypeClusterIP
 	}
+}
+
+func (s ServiceFlags) IsL7LB() bool {
+	return s&serviceFlagL7LoadBalancer != 0
 }
 
 // SVCExtTrafficPolicy returns a service traffic policy from the flags
@@ -183,6 +193,15 @@ func (s ServiceFlags) SVCNatPolicy(fe L3n4Addr) SVCNatPolicy {
 	}
 }
 
+// SVCSlotQuarantined
+func (s ServiceFlags) SVCSlotQuarantined() bool {
+	if s&serviceFlagQuarantined == 0 {
+		return false
+	} else {
+		return true
+	}
+}
+
 // String returns the string implementation of ServiceFlags.
 func (s ServiceFlags) String() string {
 	var str []string
@@ -215,7 +234,9 @@ func (s ServiceFlags) String() string {
 	if s&serviceFlagLoopback != 0 {
 		str = append(str, "loopback")
 	}
-
+	if s&serviceFlagQuarantined != 0 {
+		str = append(str, "quarantined")
+	}
 	return strings.Join(str, ", ")
 }
 
@@ -320,10 +341,8 @@ func GetBackendStateFromFlags(flags uint8) BackendState {
 // DefaultBackendWeight is used when backend weight is not set in ServiceSpec
 const DefaultBackendWeight = 100
 
-var (
-	// AllProtocols is the list of all supported L4 protocols
-	AllProtocols = []L4Type{TCP, UDP, SCTP}
-)
+// AllProtocols is the list of all supported L4 protocols
+var AllProtocols = []L4Type{TCP, UDP, SCTP}
 
 // L4Type name.
 type L4Type = string
@@ -340,6 +359,32 @@ type ServiceName struct {
 	Namespace string
 	Name      string
 	Cluster   string
+}
+
+func (n *ServiceName) Equal(other ServiceName) bool {
+	return n.Namespace == other.Namespace &&
+		n.Name == other.Name &&
+		n.Cluster == other.Cluster
+}
+
+func (n ServiceName) Compare(other ServiceName) int {
+	switch {
+	case n.Namespace < other.Namespace:
+		return -1
+	case n.Namespace > other.Namespace:
+		return 1
+	case n.Name < other.Name:
+		return -1
+	case n.Name > other.Name:
+		return 1
+	case n.Cluster < other.Cluster:
+		return -1
+	case n.Cluster > other.Cluster:
+		return 1
+	default:
+		return 0
+	}
+
 }
 
 func (n ServiceName) String() string {
@@ -373,6 +418,8 @@ type Backend struct {
 	// Node hosting this backend. This is used to determine backends local to
 	// a node.
 	NodeName string
+	// Zone where backend is located.
+	ZoneID uint8
 	L3n4Addr
 	// State of the backend for load-balancing service traffic
 	State BackendState
@@ -381,7 +428,8 @@ type Backend struct {
 }
 
 func (b *Backend) String() string {
-	return b.L3n4Addr.String()
+	state, _ := b.State.String()
+	return "[" + b.L3n4Addr.String() + "," + "State:" + state + "]"
 }
 
 // SVC is a structure for storing service details.
@@ -397,9 +445,9 @@ type SVC struct {
 	HealthCheckNodePort       uint16      // Service health check node port
 	Name                      ServiceName // Fully qualified service name
 	LoadBalancerSourceRanges  []*cidr.CIDR
-	L7LBProxyPort             uint16   // Non-zero for L7 LB services
-	L7LBFrontendPorts         []string // Non-zero for L7 LB frontend service ports
+	L7LBProxyPort             uint16 // Non-zero for L7 LB services
 	LoopbackHostport          bool
+	Annotations               map[string]string
 }
 
 func (s *SVC) GetModel() *models.Service {
@@ -624,20 +672,11 @@ func NewL3n4AddrFromModel(base *models.FrontendAddress) (*L3n4Addr, error) {
 // NewBackend creates the Backend struct instance from given params.
 // The default state for the returned Backend is BackendStateActive.
 func NewBackend(id BackendID, protocol L4Type, addrCluster cmtypes.AddrCluster, portNumber uint16) *Backend {
-	lbport := NewL4Addr(protocol, portNumber)
-	b := Backend{
-		ID:        id,
-		L3n4Addr:  L3n4Addr{AddrCluster: addrCluster, L4Addr: *lbport},
-		State:     BackendStateActive,
-		Preferred: Preferred(false),
-		Weight:    DefaultBackendWeight,
-	}
-
-	return &b
+	return NewBackendWithState(id, protocol, addrCluster, portNumber, 0, BackendStateActive)
 }
 
 // NewBackendWithState creates the Backend struct instance from given params.
-func NewBackendWithState(id BackendID, protocol L4Type, addrCluster cmtypes.AddrCluster, portNumber uint16,
+func NewBackendWithState(id BackendID, protocol L4Type, addrCluster cmtypes.AddrCluster, portNumber uint16, zone uint8,
 	state BackendState) *Backend {
 	lbport := NewL4Addr(protocol, portNumber)
 	b := Backend{
@@ -645,6 +684,7 @@ func NewBackendWithState(id BackendID, protocol L4Type, addrCluster cmtypes.Addr
 		L3n4Addr: L3n4Addr{AddrCluster: addrCluster, L4Addr: *lbport},
 		State:    state,
 		Weight:   DefaultBackendWeight,
+		ZoneID:   zone,
 	}
 
 	return &b
@@ -668,6 +708,7 @@ func NewBackendFromBackendModel(base *models.BackendAddress) (*Backend, error) {
 
 	b := &Backend{
 		NodeName:  base.NodeName,
+		ZoneID:    option.Config.GetZoneID(base.Zone),
 		L3n4Addr:  L3n4Addr{AddrCluster: addrCluster, L4Addr: *l4addr},
 		State:     state,
 		Preferred: Preferred(base.Preferred),
@@ -725,6 +766,7 @@ func (b *Backend) GetBackendModel() *models.BackendAddress {
 		IP:        &addrClusterStr,
 		Port:      b.Port,
 		NodeName:  b.NodeName,
+		Zone:      option.Config.GetZone(b.ZoneID),
 		State:     stateStr,
 		Preferred: bool(b.Preferred),
 		Weight:    &b.Weight,
@@ -739,9 +781,9 @@ func (a *L3n4Addr) String() string {
 		scope = "/i"
 	}
 	if a.IsIPv6() {
-		return fmt.Sprintf("[%s]:%d%s", a.AddrCluster.String(), a.Port, scope)
+		return "[" + a.AddrCluster.String() + "]:" + strconv.FormatUint(uint64(a.Port), 10) + scope
 	}
-	return fmt.Sprintf("%s:%d%s", a.AddrCluster.String(), a.Port, scope)
+	return a.AddrCluster.String() + ":" + strconv.FormatUint(uint64(a.Port), 10) + scope
 }
 
 // StringWithProtocol returns the L3n4Addr in the "IPv4:Port/Protocol[/Scope]"
@@ -752,9 +794,9 @@ func (a *L3n4Addr) StringWithProtocol() string {
 		scope = "/i"
 	}
 	if a.IsIPv6() {
-		return fmt.Sprintf("[%s]:%d/%s%s", a.AddrCluster.String(), a.Port, a.Protocol, scope)
+		return "[" + a.AddrCluster.String() + "]:" + strconv.FormatUint(uint64(a.Port), 10) + "/" + a.Protocol + scope
 	}
-	return fmt.Sprintf("%s:%d/%s%s", a.AddrCluster.String(), a.Port, a.Protocol, scope)
+	return a.AddrCluster.String() + ":" + strconv.FormatUint(uint64(a.Port), 10) + "/" + a.Protocol + scope
 }
 
 // StringID returns the L3n4Addr as string to be used for unique identification
@@ -787,6 +829,13 @@ func (a L3n4Addr) Hash() string {
 // IsIPv6 returns true if the IP address in the given L3n4Addr is IPv6 or not.
 func (a *L3n4Addr) IsIPv6() bool {
 	return a.AddrCluster.Is6()
+}
+
+// ProtocolsEqual returns true if protocols match for both L3 and L4.
+func (l *L3n4Addr) ProtocolsEqual(o *L3n4Addr) bool {
+	return l.Protocol == o.Protocol &&
+		(l.AddrCluster.Is4() && o.AddrCluster.Is4() ||
+			l.AddrCluster.Is6() && o.AddrCluster.Is6())
 }
 
 // L3n4AddrID is used to store, as an unique L3+L4 plus the assigned ID, in the

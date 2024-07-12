@@ -15,9 +15,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
-	"time"
 
-	"github.com/miekg/dns"
+	"github.com/cilium/dns"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/sys/unix"
@@ -25,7 +24,7 @@ import (
 	"github.com/cilium/cilium/pkg/datapath/linux/linux_defaults"
 	"github.com/cilium/cilium/pkg/endpoint"
 	"github.com/cilium/cilium/pkg/fqdn/matchpattern"
-	"github.com/cilium/cilium/pkg/fqdn/re"
+	"github.com/cilium/cilium/pkg/fqdn/proxy/ipfamily"
 	"github.com/cilium/cilium/pkg/fqdn/restore"
 	"github.com/cilium/cilium/pkg/identity"
 	ippkg "github.com/cilium/cilium/pkg/ip"
@@ -37,6 +36,7 @@ import (
 	"github.com/cilium/cilium/pkg/policy"
 	"github.com/cilium/cilium/pkg/proxy/accesslog"
 	"github.com/cilium/cilium/pkg/spanstat"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 const (
@@ -59,12 +59,6 @@ const (
 // A singleton is always running inside cilium-agent.
 // Note: All public fields are read only and do not require locking
 type DNSProxy struct {
-	// BindAddr is the local address the server is using to listen for DNS
-	// requests. This is a read-only value and reflects the actual value. Passing
-	// ":0" to StartDNSProxy will allow the kernel to set the port, and that can
-	// be read here.
-	BindAddr string
-
 	// BindPort is the port in BindAddr.
 	BindPort uint16
 
@@ -94,9 +88,11 @@ type DNSProxy struct {
 	// design now.
 	NotifyOnDNSMsg NotifyOnDNSMsgFunc
 
-	// UDPServer, TCPServer are the miekg/dns server instances. They handle DNS
-	// parsing etc. for us.
-	UDPServer, TCPServer *dns.Server
+	// DNSServers are the cilium/dns server instances.
+	// Depending on the configuration, these might be
+	// TCPv4, UDPv4, TCPv6 and/or UDPv4.
+	// They handle DNS parsing etc. for us.
+	DNSServers []*dns.Server
 
 	// EnableDNSCompression allows the DNS proxy to compress responses to
 	// endpoints that are larger than 512 Bytes or the EDNS0 option, if present.
@@ -115,7 +111,7 @@ type DNSProxy struct {
 	// lookupTargetDNSServer extracts the originally intended target of a DNS
 	// query. It is always set to lookupTargetDNSServer in
 	// helpers.go but is modified during testing.
-	lookupTargetDNSServer func(w dns.ResponseWriter) (serverIP net.IP, serverPort uint16, addrStr string, err error)
+	lookupTargetDNSServer func(w dns.ResponseWriter) (serverIP net.IP, serverPort restore.PortProto, addrStr string, err error)
 
 	// maxIPsPerRestoredDNSRule is the maximum number of IPs to maintain for each
 	// restored DNS rule.
@@ -123,6 +119,9 @@ type DNSProxy struct {
 
 	// this mutex protects variables below this point
 	lock.RWMutex
+
+	// DNSClients is a container for dns.SharedClient instances.
+	DNSClients *dns.SharedClients
 
 	// usedServers is the set of DNS servers that have been allowed and used successfully.
 	// This is used to limit the number of IPs we store for restored DNS rules.
@@ -149,7 +148,7 @@ type DNSProxy struct {
 
 	// rejectReply is the OPCode send from the DNS-proxy to the endpoint if the
 	// DNS request is invalid
-	rejectReply int32
+	rejectReply atomic.Int32
 
 	// UnbindAddress unbinds dns servers from socket in order to stop serving DNS traffic before proxy shutdown
 	unbindAddress func()
@@ -166,18 +165,18 @@ type regexCacheEntry struct {
 // have the same set of rules, or the same rule applies to multiple endpoints.
 type regexCache map[string]*regexCacheEntry
 
-// perEPAllow maps EndpointIDs to ports + selectors + rules
-type perEPAllow map[uint64]portToSelectorAllow
+// perEPAllow maps EndpointIDs to protocols + ports + selectors + rules
+type perEPAllow map[uint64]portProtoToSelectorAllow
 
-// portToSelectorAllow maps port numbers to selectors + rules
-type portToSelectorAllow map[uint16]CachedSelectorREEntry
+// portProtoToSelectorAllow maps protocol-port numbers to selectors + rules
+type portProtoToSelectorAllow map[restore.PortProto]CachedSelectorREEntry
 
 // CachedSelectorREEntry maps port numbers to selectors to rules, mirroring
 // policy.L7DataMap but the DNS rules are compiled into a regex
 type CachedSelectorREEntry map[policy.CachedSelector]*regexp.Regexp
 
 // structure for restored rules that can be used while Cilium agent is restoring endpoints
-type perEPRestored map[uint64]map[uint16][]restoredIPRule
+type perEPRestored map[uint64]map[restore.PortProto][]restoredIPRule
 
 // restoredIPRule is the dnsproxy internal way of representing a restored IPRule
 // where we also store the actual compiled regular expression as a, as well
@@ -188,7 +187,7 @@ type restoredIPRule struct {
 }
 
 // map from EP IPs to *Endpoint
-type restoredEPs map[string]*endpoint.Endpoint
+type restoredEPs map[netip.Addr]*endpoint.Endpoint
 
 // asIPRule returns a new restore.IPRule representing the rules, including the provided IP map.
 func asIPRule(r *regexp.Regexp, IPs map[string]struct{}) restore.IPRule {
@@ -201,15 +200,24 @@ func asIPRule(r *regexp.Regexp, IPs map[string]struct{}) restore.IPRule {
 
 // CheckRestored checks endpointID, destPort, destIP, and name against the restored rules,
 // and only returns true if a restored rule matches.
-func (p *DNSProxy) checkRestored(endpointID uint64, destPort uint16, destIP string, name string) bool {
-	ipRules, exists := p.restored[endpointID][destPort]
-	if !exists {
-		return false
+func (p *DNSProxy) checkRestored(endpointID uint64, destPortProto restore.PortProto, destIP string, name string) bool {
+	ipRules, exists := p.restored[endpointID][destPortProto]
+	if !exists && destPortProto.IsPortV2() {
+		// Check if there is a Version 1 restore.
+		ipRules, exists = p.restored[endpointID][destPortProto.ToV1()]
+		log.WithFields(logrus.Fields{
+			logfields.EndpointID: endpointID,
+			logfields.Port:       destPortProto.Port(),
+			logfields.Protocol:   destPortProto.Protocol(),
+		}).Debugf("Checking if restored V1 IP rules (exists: %t) for endpoint: %+v", exists, ipRules)
+		if !exists {
+			return false
+		}
 	}
 
 	for i := range ipRules {
 		ipRule := ipRules[i]
-		if _, exists := ipRule.IPs[destIP]; exists || ipRule.IPs == nil {
+		if _, exists := ipRule.IPs[destIP]; exists || len(ipRule.IPs) == 0 {
 			if ipRule.regex != nil && ipRule.regex.MatchString(name) {
 				return true
 			}
@@ -244,15 +252,15 @@ func (p *DNSProxy) GetRules(endpointID uint16) (restore.DNSRules, error) {
 		cs policy.CachedSelector
 	}
 
-	portToSelRegex := make(map[uint16][]selRegex)
-	for port, entries := range p.allowed[uint64(endpointID)] {
-		var nidRules = make([]selRegex, 0, len(entries))
+	portProtoToSelRegex := make(map[restore.PortProto][]selRegex)
+	for pp, entries := range p.allowed[uint64(endpointID)] {
+		nidRules := make([]selRegex, 0, len(entries))
 		// Copy the entries to avoid racy map accesses after we release the lock. We don't need
 		// constant time access, hence a preallocated slice instead of another map.
 		for cs, regex := range entries {
 			nidRules = append(nidRules, selRegex{cs: cs, re: regex})
 		}
-		portToSelRegex[port] = nidRules
+		portProtoToSelRegex[pp] = nidRules
 	}
 
 	// We've read what we need from the proxy. The following IPCache lookups _must_ occur outside of
@@ -260,7 +268,7 @@ func (p *DNSProxy) GetRules(endpointID uint16) (restore.DNSRules, error) {
 	p.RUnlock()
 
 	restored := make(restore.DNSRules)
-	for port, selRegexes := range portToSelRegex {
+	for pp, selRegexes := range portProtoToSelRegex {
 		var ipRules restore.IPRules
 		for _, selRegex := range selRegexes {
 			if selRegex.cs.IsWildcard() {
@@ -284,7 +292,8 @@ func (p *DNSProxy) GetRules(endpointID uint16) (restore.DNSRules, error) {
 					if count > p.maxIPsPerRestoredDNSRule {
 						log.WithFields(logrus.Fields{
 							logfields.EndpointID:            endpointID,
-							logfields.Port:                  port,
+							logfields.Port:                  pp.Port(),
+							logfields.Protocol:              pp.Protocol(),
 							logfields.EndpointLabelSelector: selRegex.cs,
 							logfields.Limit:                 p.maxIPsPerRestoredDNSRule,
 							logfields.Count:                 len(nidIPs),
@@ -297,7 +306,7 @@ func (p *DNSProxy) GetRules(endpointID uint16) (restore.DNSRules, error) {
 			}
 			ipRules = append(ipRules, asIPRule(selRegex.re, ips))
 		}
-		restored[port] = ipRules
+		restored[pp] = ipRules
 	}
 
 	return restored, nil
@@ -311,13 +320,19 @@ func (p *DNSProxy) RestoreRules(ep *endpoint.Endpoint) {
 	p.Lock()
 	defer p.Unlock()
 	if ep.IPv4.IsValid() {
-		p.restoredEPs[ep.IPv4.String()] = ep
+		p.restoredEPs[ep.IPv4] = ep
 	}
 	if ep.IPv6.IsValid() {
-		p.restoredEPs[ep.IPv6.String()] = ep
+		p.restoredEPs[ep.IPv6] = ep
 	}
-	restoredRules := make(map[uint16][]restoredIPRule, len(ep.DNSRules))
-	for port, dnsRule := range ep.DNSRules {
+	// Use V2 if it is populated, otherwise
+	// use V1.
+	dnsRules := ep.DNSRulesV2
+	if len(dnsRules) == 0 && len(ep.DNSRules) > 0 {
+		dnsRules = ep.DNSRules
+	}
+	restoredRules := make(map[restore.PortProto][]restoredIPRule, len(ep.DNSRules))
+	for pp, dnsRule := range dnsRules {
 		ipRules := make([]restoredIPRule, 0, len(dnsRule))
 		for _, ipRule := range dnsRule {
 			if ipRule.Re.Pattern == nil {
@@ -337,11 +352,11 @@ func (p *DNSProxy) RestoreRules(ep *endpoint.Endpoint) {
 			}
 			ipRules = append(ipRules, rule)
 		}
-		restoredRules[port] = ipRules
+		restoredRules[pp] = ipRules
 	}
 	p.restored[uint64(ep.ID)] = restoredRules
 
-	log.Debugf("Restored rules for endpoint %d: %v", ep.ID, ep.DNSRules)
+	log.Debugf("Restored rules for endpoint %d: %v", ep.ID, dnsRules)
 }
 
 // 'p' must be locked
@@ -378,7 +393,7 @@ func (c regexCache) lookupOrCompileRegex(pattern string) (*regexp.Regexp, error)
 		entry.referenceCount += 1
 		return entry.regex, nil
 	}
-	regex, err := re.CompileRegex(pattern)
+	regex, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, err
 	}
@@ -422,25 +437,26 @@ func (c regexCache) releaseRegex(regex *regexp.Regexp) {
 
 // removeAndReleasePortRulesForID removes the old port rules for the given destPort on the given endpointID. It also
 // releases the regexes so that unused regex can be freed from memory.
-func (allow perEPAllow) removeAndReleasePortRulesForID(cache regexCache, endpointID uint64, destPort uint16) {
-	epPorts, hasEpPorts := allow[endpointID]
-	if !hasEpPorts {
+
+func (allow perEPAllow) removeAndReleasePortRulesForID(cache regexCache, endpointID uint64, destPortProto restore.PortProto) {
+	epPortProtos, hasEpPortProtos := allow[endpointID]
+	if !hasEpPortProtos {
 		return
 	}
-	for _, m := range epPorts[destPort] {
+	for _, m := range epPortProtos[destPortProto] {
 		cache.releaseRegex(m)
 	}
-	delete(epPorts, destPort)
-	if len(epPorts) == 0 {
+	delete(epPortProtos, destPortProto)
+	if len(epPortProtos) == 0 {
 		delete(allow, endpointID)
 	}
 }
 
 // setPortRulesForID sets the matching rules for endpointID and destPort for
 // later lookups. It converts newRules into a compiled regex
-func (allow perEPAllow) setPortRulesForID(cache regexCache, endpointID uint64, destPort uint16, newRules policy.L7DataMap) error {
+func (allow perEPAllow) setPortRulesForID(cache regexCache, endpointID uint64, destPortProto restore.PortProto, newRules policy.L7DataMap) error {
 	if len(newRules) == 0 {
-		allow.removeAndReleasePortRulesForID(cache, endpointID, destPort)
+		allow.removeAndReleasePortRulesForID(cache, endpointID, destPortProto)
 		return nil
 	}
 	cse := make(CachedSelectorREEntry, len(newRules))
@@ -464,22 +480,22 @@ func (allow perEPAllow) setPortRulesForID(cache regexCache, endpointID uint64, d
 		}
 		return err
 	}
-	allow.removeAndReleasePortRulesForID(cache, endpointID, destPort)
-	epPorts, exist := allow[endpointID]
+	allow.removeAndReleasePortRulesForID(cache, endpointID, destPortProto)
+	epPortProtos, exist := allow[endpointID]
 	if !exist {
-		epPorts = make(portToSelectorAllow)
-		allow[endpointID] = epPorts
+		epPortProtos = make(portProtoToSelectorAllow)
+		allow[endpointID] = epPortProtos
 	}
-	epPorts[destPort] = cse
+	epPortProtos[destPortProto] = cse
 	return nil
 }
 
 // setPortRulesForIDFromUnifiedFormat sets the matching rules for endpointID and destPort for
 // later lookups. It does not guarantee it will reuse all the provided regexes, since it will reuse
 // already existing regexes with the same pattern in case they are already in use.
-func (allow perEPAllow) setPortRulesForIDFromUnifiedFormat(cache regexCache, endpointID uint64, destPort uint16, newRules CachedSelectorREEntry) error {
+func (allow perEPAllow) setPortRulesForIDFromUnifiedFormat(cache regexCache, endpointID uint64, destPortProto restore.PortProto, newRules CachedSelectorREEntry) error {
 	if len(newRules) == 0 {
-		allow.removeAndReleasePortRulesForID(cache, endpointID, destPort)
+		allow.removeAndReleasePortRulesForID(cache, endpointID, destPortProto)
 		return nil
 	}
 	cse := make(CachedSelectorREEntry, len(newRules))
@@ -489,26 +505,34 @@ func (allow perEPAllow) setPortRulesForIDFromUnifiedFormat(cache regexCache, end
 		cse[selector] = cache.lookupOrInsertRegex(providedRegex)
 	}
 
-	allow.removeAndReleasePortRulesForID(cache, endpointID, destPort)
-	epPorts, exist := allow[endpointID]
+	allow.removeAndReleasePortRulesForID(cache, endpointID, destPortProto)
+	epPortProtos, exist := allow[endpointID]
 	if !exist {
-		epPorts = make(portToSelectorAllow)
-		allow[endpointID] = epPorts
+		epPortProtos = make(portProtoToSelectorAllow)
+		allow[endpointID] = epPortProtos
 	}
-	epPorts[destPort] = cse
+	epPortProtos[destPortProto] = cse
 	return nil
 }
 
 // getPortRulesForID returns a precompiled regex representing DNS rules for the
 // passed-in endpointID and destPort with setPortRulesForID
-func (allow perEPAllow) getPortRulesForID(endpointID uint64, destPort uint16) (rules CachedSelectorREEntry, exists bool) {
-	rules, exists = allow[endpointID][destPort]
-	return rules, exists
+func (allow perEPAllow) getPortRulesForID(endpointID uint64, destPortProto restore.PortProto) (rules CachedSelectorREEntry, exists bool) {
+	rules, exists = allow[endpointID][destPortProto]
+	if !exists && destPortProto.Protocol() != 0 {
+		rules, exists = allow[endpointID][destPortProto.ToV1()]
+		log.WithFields(logrus.Fields{
+			logfields.EndpointID: endpointID,
+			logfields.Port:       destPortProto.Port(),
+			logfields.Protocol:   destPortProto.Protocol(),
+		}).Debugf("Checking for V1 port rule (exists: %t) for endpoint: %+v", exists, rules)
+	}
+	return
 }
 
 // LookupEndpointIDByIPFunc wraps logic to lookup an endpoint with any backend.
 // See DNSProxy.LookupRegisteredEndpoint for usage.
-type LookupEndpointIDByIPFunc func(ip net.IP) (endpoint *endpoint.Endpoint, err error)
+type LookupEndpointIDByIPFunc func(ip netip.Addr) (endpoint *endpoint.Endpoint, err error)
 
 // LookupSecIDByIPFunc Func wraps logic to lookup an IP's security ID from the
 // ipcache.
@@ -533,6 +557,7 @@ func (e ErrFailedAcquireSemaphore) Timeout() bool { return true }
 
 // Temporary is deprecated. Return false.
 func (e ErrFailedAcquireSemaphore) Temporary() bool { return false }
+
 func (e ErrFailedAcquireSemaphore) Error() string {
 	return fmt.Sprintf(
 		"failed to acquire DNS proxy semaphore, %d parallel requests already in-flight",
@@ -590,8 +615,20 @@ func (proxyStat *ProxyRequestContext) IsTimeout() bool {
 	return false
 }
 
+// DNSProxyConfig is the configuration for the DNS proxy.
+type DNSProxyConfig struct {
+	Address                string
+	Port                   uint16
+	IPv4                   bool
+	IPv6                   bool
+	EnableDNSCompression   bool
+	MaxRestoreDNSIPs       int
+	ConcurrencyLimit       int
+	ConcurrencyGracePeriod time.Duration
+}
+
 // StartDNSProxy starts a proxy used for DNS L7 redirects that listens on
-// address and port.
+// address and port on IPv4 and/or IPv6 depending on the values of ipv4/ipv6.
 // address is the bind address to listen on. Empty binds to all local
 // addresses.
 // port is the port to bind to for both UDP and TCP. 0 causes the kernel to
@@ -602,14 +639,13 @@ func (proxyStat *ProxyRequestContext) IsTimeout() bool {
 // requesting endpoint. Note that denied requests will not trigger this
 // callback.
 func StartDNSProxy(
-	address string, port uint16, enableDNSCompression bool, maxRestoreDNSIPs int,
+	dnsProxyConfig DNSProxyConfig,
 	lookupEPFunc LookupEndpointIDByIPFunc,
 	lookupSecIDFunc LookupSecIDByIPFunc,
 	lookupIPsFunc LookupIPsBySecIDFunc,
 	notifyFunc NotifyOnDNSMsgFunc,
-	concurrencyLimit int, concurrencyGracePeriod time.Duration,
 ) (*DNSProxy, error) {
-	if port == 0 {
+	if dnsProxyConfig.Port == 0 {
 		log.Debug("DNS Proxy port is configured to 0. A random port will be assigned by the OS.")
 	}
 
@@ -629,27 +665,26 @@ func StartDNSProxy(
 		restored:                 make(perEPRestored),
 		restoredEPs:              make(restoredEPs),
 		cache:                    make(regexCache),
-		EnableDNSCompression:     enableDNSCompression,
-		maxIPsPerRestoredDNSRule: maxRestoreDNSIPs,
+		EnableDNSCompression:     dnsProxyConfig.EnableDNSCompression,
+		maxIPsPerRestoredDNSRule: dnsProxyConfig.MaxRestoreDNSIPs,
+		DNSClients:               dns.NewSharedClients(),
 	}
-	if concurrencyLimit > 0 {
-		p.ConcurrencyLimit = semaphore.NewWeighted(int64(concurrencyLimit))
-		p.ConcurrencyGracePeriod = concurrencyGracePeriod
+	if dnsProxyConfig.ConcurrencyLimit > 0 {
+		p.ConcurrencyLimit = semaphore.NewWeighted(int64(dnsProxyConfig.ConcurrencyLimit))
+		p.ConcurrencyGracePeriod = dnsProxyConfig.ConcurrencyGracePeriod
 	}
-	atomic.StoreInt32(&p.rejectReply, dns.RcodeRefused)
+	p.rejectReply.Store(dns.RcodeRefused)
 
-	// Start the DNS listeners on UDP and TCP
+	// Start the DNS listeners on UDP and TCP for IPv4 and/or IPv6
 	var (
-		UDPConn     *net.UDPConn
-		TCPListener *net.TCPListener
-		err         error
-
-		EnableIPv4, EnableIPv6 = option.Config.EnableIPv4, option.Config.EnableIPv6
+		dnsServers []*dns.Server
+		bindPort   uint16
+		err        error
 	)
 
 	start := time.Now()
 	for time.Since(start) < ProxyBindTimeout {
-		UDPConn, TCPListener, err = bindToAddr(address, port, EnableIPv4, EnableIPv6)
+		dnsServers, bindPort, err = bindToAddr(dnsProxyConfig.Address, dnsProxyConfig.Port, p, dnsProxyConfig.IPv4, dnsProxyConfig.IPv6)
 		if err == nil {
 			break
 		}
@@ -657,47 +692,56 @@ func StartDNSProxy(
 		time.Sleep(ProxyBindRetryInterval)
 	}
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to bind DNS proxy: %w", err)
 	}
 
-	p.BindAddr = UDPConn.LocalAddr().String()
-	p.BindPort = uint16(UDPConn.LocalAddr().(*net.UDPAddr).Port)
-	p.UDPServer = &dns.Server{PacketConn: UDPConn, Addr: p.BindAddr, Net: "udp", Handler: p,
-		SessionUDPFactory: &sessionUDPFactory{ipv4Enabled: EnableIPv4, ipv6Enabled: EnableIPv6},
-	}
-	p.TCPServer = &dns.Server{Listener: TCPListener, Addr: p.BindAddr, Net: "tcp", Handler: p}
-	log.WithField("address", p.BindAddr).Debug("DNS Proxy bound to address")
+	p.BindPort = bindPort
+	p.DNSServers = dnsServers
 
-	for _, s := range []*dns.Server{p.UDPServer, p.TCPServer} {
+	log.WithField("port", bindPort).WithField("addresses", len(dnsServers)).Debug("DNS Proxy bound to addresses")
+
+	for _, s := range p.DNSServers {
 		go func(server *dns.Server) {
 			// try 5 times during a single ProxyBindTimeout period. We fatal here
 			// because we have no other way to indicate failure this late.
 			start := time.Now()
+			var err error
 			for time.Since(start) < ProxyBindTimeout {
-				if err := server.ActivateAndServe(); err != nil {
+				log.Debugf("Trying to start the %s DNS proxy on %s", server.Net, server.Addr)
+
+				if err = server.ActivateAndServe(); err != nil {
 					log.WithError(err).Errorf("Failed to start the %s DNS proxy on %s", server.Net, server.Addr)
+					time.Sleep(ProxyBindRetryInterval)
+					continue
 				}
-				time.Sleep(ProxyBindRetryInterval)
+				break // successful shutdown before timeout
 			}
-			log.Fatalf("Failed to start %s DNS Proxy on %s", server.Net, server.Addr)
+			if err != nil {
+				log.WithError(err).Fatalf("Failed to start the %s DNS proxy on %s", server.Net, server.Addr)
+			}
 		}(s)
 	}
 
 	// This function is called in proxy.Cleanup, which is added to Daemon cleanup module in bootstrapFQDN
-	p.unbindAddress = func() {
-		UDPConn.Close()
-		TCPListener.Close()
-	}
+	p.unbindAddress = func() { shutdownServers(p.DNSServers) }
 
 	return p, nil
 }
 
+func shutdownServers(dnsServers []*dns.Server) {
+	for _, s := range dnsServers {
+		if err := s.Shutdown(); err != nil {
+			log.WithError(err).Errorf("Failed to stop the %s DNS proxy on %s", s.Net, s.Addr)
+		}
+	}
+}
+
 // LookupEndpointByIP wraps LookupRegisteredEndpoint by falling back to an restored EP, if available
-func (p *DNSProxy) LookupEndpointByIP(ip net.IP) (endpoint *endpoint.Endpoint, err error) {
+func (p *DNSProxy) LookupEndpointByIP(ip netip.Addr) (endpoint *endpoint.Endpoint, err error) {
 	endpoint, err = p.LookupRegisteredEndpoint(ip)
 	if err != nil {
 		// Check restored endpoints
-		endpoint, found := p.restoredEPs[ip.String()]
+		endpoint, found := p.restoredEPs[ip]
 		if found {
 			return endpoint, nil
 		}
@@ -707,11 +751,11 @@ func (p *DNSProxy) LookupEndpointByIP(ip net.IP) (endpoint *endpoint.Endpoint, e
 
 // UpdateAllowed sets newRules for endpointID and destPort. It compiles the DNS
 // rules into regexes that are then used in CheckAllowed.
-func (p *DNSProxy) UpdateAllowed(endpointID uint64, destPort uint16, newRules policy.L7DataMap) error {
+func (p *DNSProxy) UpdateAllowed(endpointID uint64, destPortProto restore.PortProto, newRules policy.L7DataMap) error {
 	p.Lock()
 	defer p.Unlock()
 
-	err := p.allowed.setPortRulesForID(p.cache, endpointID, destPort, newRules)
+	err := p.allowed.setPortRulesForID(p.cache, endpointID, destPortProto, newRules)
 	if err == nil {
 		// Rules were updated based on policy, remove restored rules
 		p.removeRestoredRulesLocked(endpointID)
@@ -720,11 +764,11 @@ func (p *DNSProxy) UpdateAllowed(endpointID uint64, destPort uint16, newRules po
 }
 
 // UpdateAllowedFromSelectorRegexes sets newRules for endpointID and destPort.
-func (p *DNSProxy) UpdateAllowedFromSelectorRegexes(endpointID uint64, destPort uint16, newRules CachedSelectorREEntry) error {
+func (p *DNSProxy) UpdateAllowedFromSelectorRegexes(endpointID uint64, destPortProto restore.PortProto, newRules CachedSelectorREEntry) error {
 	p.Lock()
 	defer p.Unlock()
 
-	err := p.allowed.setPortRulesForIDFromUnifiedFormat(p.cache, endpointID, destPort, newRules)
+	err := p.allowed.setPortRulesForIDFromUnifiedFormat(p.cache, endpointID, destPortProto, newRules)
 	if err == nil {
 		// Rules were updated based on policy, remove restored rules
 		p.removeRestoredRulesLocked(endpointID)
@@ -732,17 +776,17 @@ func (p *DNSProxy) UpdateAllowedFromSelectorRegexes(endpointID uint64, destPort 
 	return err
 }
 
-// CheckAllowed checks endpointID, destPort, destID, destIP, and name against the rules
+// CheckAllowed checks endpointID, destPortProto, destID, destIP, and name against the rules
 // added to the proxy or restored during restart, and only returns true if this all match
 // something that was added (via UpdateAllowed or RestoreRules) previously.
-func (p *DNSProxy) CheckAllowed(endpointID uint64, destPort uint16, destID identity.NumericIdentity, destIP net.IP, name string) (allowed bool, err error) {
+func (p *DNSProxy) CheckAllowed(endpointID uint64, destPortProto restore.PortProto, destID identity.NumericIdentity, destIP net.IP, name string) (allowed bool, err error) {
 	name = strings.ToLower(dns.Fqdn(name))
 	p.RLock()
 	defer p.RUnlock()
 
-	epAllow, exists := p.allowed.getPortRulesForID(endpointID, destPort)
+	epAllow, exists := p.allowed.getPortRulesForID(endpointID, destPortProto)
 	if !exists {
-		return p.checkRestored(endpointID, destPort, destIP.String(), name), nil
+		return p.checkRestored(endpointID, destPortProto, destIP.String(), name), nil
 	}
 
 	for selector, regex := range epAllow {
@@ -755,13 +799,105 @@ func (p *DNSProxy) CheckAllowed(endpointID uint64, destPort uint16, destID ident
 	return false, nil
 }
 
-func setSoMark(fd int, secId identity.NumericIdentity) error {
-	mark := linux_defaults.MagicMarkIdentity
+// setSoMarks sets the socket options needed for a transparent proxy to integrate it's upstream
+// (forwarded) connection with Cilium datapath. Some considerations for this design:
+//
+//   - Since a transparent proxy must reuse the original source IP address (and we must also
+//     intercept the responses), we instruct the host networking namespace to allow binding the
+//     local address to a foreign address and to receive packets destined to a non-local (foreign)
+//     IP address of the source pod via the IP_TRANSPARENT socket option.
+//
+//   - In order to NOT hijack some random by-standing traffic going to the original pod, we must also
+//     use the original port number.
+//
+//   - (DNS) clients use ephemeral source ports, i.e., the port can be different in every
+//     request. Typically, a DNS resolver library uses the same ephemeral port only for requests
+//     from a single "gethostbyname" API call, or equivalent.
+//
+//   - To be able to receive responses to the ephemeral source port, we must have a socket bound to
+//     that address:port (for UDP), or a connection from that address:port to the DNS server
+//     address:port (for TCP).
+//
+//   - This leads to a new DNS client and socket for every different original source address -
+//     ephemeral port pair we see. We also need to make sure these were actually used to communicate
+//     with the DNS server, so we use the whole 5-tuple as a key.
+//
+// Why can't we keep DNS clients pooled and ready to receive traffic between client requests?
+//
+//   - We have no guarantees that the source pod will keep on using the same ephemeral port in
+//     future. We've had upstream socket bind errors (in Envoy, where we have operated in this mode
+//     for years already) when a client pod has rapidly cycled through its ephemeral port space,
+//     e.g. when performing netperf CRR or similar performance tests.
+//
+//   - We could try to keep the client and its bound socket around for some minimal time to save
+//     resources when a DNS resolver is enumerating through its domain suffix list, where it seems
+//     likely that the same source ephemeral port is going to be reused until the resolver gets an
+//     actual result with an IPv4/6 address or quits trying. It might be safe to close the client
+//     socket only after a response with the `A`/`AAAA` records have been passed back to the pod,
+//     or after a timeout of a few milliseconds. This would be something we currently don't do and
+//     is prone to socket bind errors, so this is left for a later exercise.
+//
+//   - So the client socket can not be left lingering around, as it causes network traffic destined
+//     for the source pod to be intercepted to the dnsproxy, which is exactly what we want but only
+//     until a DNS response has been received.
+func setSoMarks(fd int, ipFamily ipfamily.IPFamily, secId identity.NumericIdentity) error {
+	// Set SO_MARK to allow datapath to know these upstream packets from an egress proxy
+	mark := linux_defaults.MagicMarkEgress
 	mark |= int(uint32(secId&0xFFFF)<<16 | uint32((secId&0xFF0000)>>16))
 	err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, mark)
 	if err != nil {
 		return fmt.Errorf("error setting SO_MARK: %w", err)
 	}
+
+	// Rest of the options are only set in the transparent mode.
+	if !option.Config.DNSProxyEnableTransparentMode {
+		return nil
+	}
+
+	// Set IP_TRANSPARENT to be able to use a non-host address as the source address
+	if err := unix.SetsockoptInt(fd, ipFamily.SocketOptsFamily, ipFamily.SocketOptsTransparent, 1); err != nil {
+		return fmt.Errorf("setsockopt(IP_TRANSPARENT) for %s failed: %w", ipFamily.Name, err)
+	}
+
+	// Set SO_REUSEADDR to allow binding to an address that is already used by some other
+	// connection in a lingering state. This is needed in cases where we close a client
+	// connection but the client issues new requests re-using its source port. In that case we
+	// need to be able to reuse the address likely very soon after the prior close, which may
+	// not be allowed without this option.
+	if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+		return fmt.Errorf("setsockopt(SO_REUSEADDR) failed: %w", err)
+	}
+
+	// Set SO_REUSEPORT to allow two active connections to bind to the same address and
+	// port. Normally this would not be needed, but is set to allow a new connection to be
+	// created on a port where the old connection may not yet be closed. If two UDP sockets
+	// using the same port due to this option were reading at the same time, the OS stack would
+	// distribute incoming packets to them essentially randomly. We do not want that, so we
+	// strive to avoid that situation. This may be helpful in avoiding bind errors in some cases
+	// regardless.
+	if !option.Config.EnableBPFTProxy {
+		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+			return fmt.Errorf("setsockopt(SO_REUSEPORT) failed: %w", err)
+		}
+	}
+
+	// Set SO_LINGER to ensure the TCP socket is closed and ready to be re-used in case
+	// the client reuses the same source port in short succession (this is e.g. the case
+	// with glibc). If SO_LINGER is not used, the old socket might have not yet reached
+	// the TIME_WAIT state by the time we are trying to reuse the port on a new socket.
+	// If that happens, the connect() call will fail with EADDRNOTAVAIL.
+	// Note that the linger timeout can also be set to 0, in which case the socket is
+	// terminated forcefully with a TCP RST and thus can also be reused immediately.
+	if linger := option.Config.DNSProxySocketLingerTimeout; linger >= 0 {
+		err = unix.SetsockoptLinger(fd, unix.SOL_SOCKET, unix.SO_LINGER, &unix.Linger{
+			Onoff:  1,
+			Linger: int32(linger),
+		})
+		if err != nil {
+			return fmt.Errorf("setsockopt(SO_LINGER) failed: %w", err)
+		}
+	}
+
 	return nil
 }
 
@@ -814,7 +950,7 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 
 	scopedLog.Debug("Handling DNS query from endpoint")
 
-	addr, _, err := net.SplitHostPort(epIPPort)
+	addrPort, err := netip.ParseAddrPort(epIPPort)
 	if err != nil {
 		scopedLog.WithError(err).Error("cannot extract endpoint IP from DNS request")
 		stat.Err = fmt.Errorf("Cannot extract endpoint IP from DNS request: %w", err)
@@ -823,7 +959,8 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		p.sendRefused(scopedLog, w, request)
 		return
 	}
-	ep, err := p.LookupEndpointByIP(net.ParseIP(addr))
+	epAddr := addrPort.Addr()
+	ep, err := p.LookupEndpointByIP(epAddr)
 	if err != nil {
 		scopedLog.WithError(err).Error("cannot extract endpoint ID from DNS request")
 		stat.Err = fmt.Errorf("Cannot extract endpoint ID from DNS request: %w", err)
@@ -838,7 +975,7 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		logfields.Identity:   ep.GetIdentity(),
 	})
 
-	targetServerIP, targetServerPort, targetServerAddrStr, err := p.lookupTargetDNSServer(w)
+	targetServerIP, targetServerPortProto, targetServerAddrStr, err := p.lookupTargetDNSServer(w)
 	if err != nil {
 		log.WithError(err).Error("cannot extract destination IP:port from DNS request")
 		stat.Err = fmt.Errorf("Cannot extract destination IP:port from DNS request: %w", err)
@@ -848,9 +985,9 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 		return
 	}
 
-	targetServerID := identity.ReservedIdentityWorld
 	// Ignore invalid IP - getter will handle invalid value.
 	targetServerAddr, _ := ippkg.AddrFromIP(targetServerIP)
+	targetServerID := identity.GetWorldIdentityFromIP(targetServerAddr)
 	if serverSecID, exists := p.LookupSecIDByIP(targetServerAddr); !exists {
 		scopedLog.WithField("server", targetServerAddrStr).Debug("cannot find server ip in ipcache, defaulting to WORLD")
 	} else {
@@ -864,7 +1001,7 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	// it won't enforce any separation between results from different endpoints.
 	// This isn't ideal but we are trusting the DNS responses anyway.
 	stat.PolicyCheckTime.Start()
-	allowed, err := p.CheckAllowed(uint64(ep.ID), targetServerPort, targetServerID, targetServerIP, qname)
+	allowed, err := p.CheckAllowed(uint64(ep.ID), targetServerPortProto, targetServerID, targetServerIP, qname)
 	stat.PolicyCheckTime.End(err == nil)
 	switch {
 	case err != nil:
@@ -892,12 +1029,9 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 
 	// Keep the same L4 protocol. This handles DNS re-requests over TCP, for
 	// requests that were too large for UDP.
-	var client *dns.Client
 	switch protocol {
 	case "udp":
-		client = &dns.Client{Net: "udp", Timeout: ProxyForwardTimeout, SingleInflight: false}
 	case "tcp":
-		client = &dns.Client{Net: "tcp", Timeout: ProxyForwardTimeout, SingleInflight: false}
 	default:
 		scopedLog.Error("Cannot parse DNS proxy client network to select forward client")
 		stat.Err = fmt.Errorf("Cannot parse DNS proxy client network to select forward client: %w", err)
@@ -909,32 +1043,48 @@ func (p *DNSProxy) ServeDNS(w dns.ResponseWriter, request *dns.Msg) {
 	stat.ProcessingTime.End(true)
 	stat.UpstreamTime.Start()
 
+	var ipFamily ipfamily.IPFamily
+	if targetServerAddr.Is4() {
+		ipFamily = ipfamily.IPv4()
+	} else {
+		ipFamily = ipfamily.IPv6()
+	}
+
 	dialer := net.Dialer{
-		Timeout: 2 * time.Second,
+		Timeout: ProxyForwardTimeout,
 		Control: func(network, address string, c syscall.RawConn) error {
 			var soerr error
 			if err := c.Control(func(su uintptr) {
-				soerr = setSoMark(int(su), ep.GetIdentity())
+				soerr = setSoMarks(int(su), ipFamily, ep.GetIdentity())
 			}); err != nil {
 				return err
 			}
 			return soerr
-		}}
-	client.Dialer = &dialer
-
-	conn, err := client.Dial(targetServerAddrStr)
-	if err != nil {
-		err := fmt.Errorf("failed to dial connection to %v: %w", targetServerAddrStr, err)
-		stat.Err = err
-		scopedLog.WithError(err).Error("Failed to dial connection to the upstream DNS server, cannot service DNS request")
-		p.NotifyOnDNSMsg(time.Now(), ep, epIPPort, targetServerID, targetServerAddrStr, request, protocol, false, &stat)
-		p.sendRefused(scopedLog, w, request)
-		return
+		},
 	}
-	defer conn.Close()
+
+	var key string
+	// Do not use original source address if
+	// - not configured, or if
+	// - the source is known to be in the host networking namespace, or
+	// - the destination is known to be outside of the cluster, or
+	// - is the local host
+	if option.Config.DNSProxyEnableTransparentMode && !ep.IsHost() && !epAddr.IsLoopback() && ep.ID != uint16(identity.ReservedIdentityHost) && targetServerID.IsCluster() && targetServerID != identity.ReservedIdentityHost {
+		dialer.LocalAddr = w.RemoteAddr()
+		key = protocol + "-" + epIPPort + "-" + targetServerAddrStr
+	}
+
+	conf := &dns.Client{
+		Net:            protocol,
+		Dialer:         &dialer,
+		Timeout:        ProxyForwardTimeout,
+		SingleInflight: false,
+	}
 
 	request.Id = dns.Id() // force a random new ID for this request
-	response, _, err := client.ExchangeWithConn(request, conn)
+	response, _, closer, err := p.DNSClients.Exchange(key, conf, request, targetServerAddrStr)
+	defer closer()
+
 	stat.UpstreamTime.End(err == nil)
 	if err != nil {
 		stat.Err = err
@@ -1001,7 +1151,7 @@ func (p *DNSProxy) enforceConcurrencyLimit(ctx context.Context) error {
 // The returned error is logged with scopedLog and is returned for convenience
 func (p *DNSProxy) sendRefused(scopedLog *logrus.Entry, w dns.ResponseWriter, request *dns.Msg) (err error) {
 	refused := new(dns.Msg)
-	refused.SetRcode(request, int(atomic.LoadInt32(&p.rejectReply)))
+	refused.SetRcode(request, int(p.rejectReply.Load()))
 
 	if err = w.WriteMsg(refused); err != nil {
 		scopedLog.WithError(err).Error("Cannot send REFUSED response")
@@ -1014,9 +1164,9 @@ func (p *DNSProxy) sendRefused(scopedLog *logrus.Entry, w dns.ResponseWriter, re
 func (p *DNSProxy) SetRejectReply(opt string) {
 	switch strings.ToLower(opt) {
 	case strings.ToLower(option.FQDNProxyDenyWithNameError):
-		atomic.StoreInt32(&p.rejectReply, dns.RcodeNameError)
+		p.rejectReply.Store(dns.RcodeNameError)
 	case strings.ToLower(option.FQDNProxyDenyWithRefused):
-		atomic.StoreInt32(&p.rejectReply, dns.RcodeRefused)
+		p.rejectReply.Store(dns.RcodeRefused)
 	default:
 		log.Infof("DNS reject response '%s' is not valid, available options are '%v'",
 			opt, option.FQDNRejectOptions)
@@ -1083,49 +1233,87 @@ func ExtractMsgDetails(msg *dns.Msg) (qname string, responseIPs []net.IP, TTL ui
 	return qname, responseIPs, TTL, CNAMEs, msg.Rcode, answerTypes, qTypes, nil
 }
 
-// bindToAddr attempts to bind to address and port for both UDP and TCP. If
-// port is 0 a random open port is assigned and the same one is used for UDP
-// and TCP.
+// bindToAddr attempts to bind to address and port for both UDP and TCP on IPv4 and/or IPv6.
+// If address is empty it automatically binds to the loopback interfaces on IPv4 and/or IPv6.
+// If port is 0 a random open port is assigned and the same one is used for UDP and TCP.
 // Note: This mimics what the dns package does EXCEPT for setting reuseport.
 // This is ok for now but it would simplify proxy management in the future to
 // have it set.
-func bindToAddr(address string, port uint16, ipv4, ipv6 bool) (*net.UDPConn, *net.TCPListener, error) {
-	var err error
-	var listener net.Listener
-	var conn net.PacketConn
+func bindToAddr(address string, port uint16, handler dns.Handler, ipv4, ipv6 bool) (dnsServers []*dns.Server, bindPort uint16, err error) {
 	defer func() {
 		if err != nil {
-			if listener != nil {
-				listener.Close()
-			}
-			if conn != nil {
-				conn.Close()
-			}
+			shutdownServers(dnsServers)
 		}
 	}()
 
-	bindAddr := net.JoinHostPort(address, strconv.Itoa(int(port)))
-
-	listener, err = listenConfig(linux_defaults.MagicMarkEgress, ipv4, ipv6).Listen(context.Background(),
-		"tcp", bindAddr)
-	if err != nil {
-		return nil, nil, err
+	var ipFamilies []ipfamily.IPFamily
+	if ipv4 {
+		ipFamilies = append(ipFamilies, ipfamily.IPv4())
+	}
+	if ipv6 {
+		ipFamilies = append(ipFamilies, ipfamily.IPv6())
 	}
 
-	conn, err = listenConfig(linux_defaults.MagicMarkEgress, ipv4, ipv6).ListenPacket(context.Background(),
-		"udp", listener.Addr().String())
-	if err != nil {
-		return nil, nil, err
+	for _, ipFamily := range ipFamilies {
+		lc := listenConfig(linux_defaults.MagicMarkEgress, ipFamily)
+
+		tcpListener, err := lc.Listen(context.Background(), ipFamily.TCPAddress, evaluateAddress(address, port, bindPort, ipFamily))
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to listen on %s: %w", ipFamily.TCPAddress, err)
+		}
+		dnsServers = append(dnsServers, &dns.Server{
+			Listener: tcpListener, Handler: handler,
+			// Explicitly set a noop factory to prevent data race detection when InitPool is called
+			// multiple times on the default factory even for TCP (IPv4 & IPv6).
+			SessionUDPFactory: &noopSessionUDPFactory{},
+			// Net & Addr are only set for logging purposes and aren't used if using ActivateAndServe.
+			Net: ipFamily.TCPAddress, Addr: tcpListener.Addr().String(),
+		})
+
+		bindPort = uint16(tcpListener.Addr().(*net.TCPAddr).Port)
+
+		udpConn, err := lc.ListenPacket(context.Background(), ipFamily.UDPAddress, evaluateAddress(address, port, bindPort, ipFamily))
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to listen on %s: %w", ipFamily.UDPAddress, err)
+		}
+		sessionUDPFactory, ferr := NewSessionUDPFactory(ipFamily)
+		if ferr != nil {
+			return nil, 0, fmt.Errorf("failed to create UDP session factory for %s: %w", ipFamily.UDPAddress, err)
+		}
+		dnsServers = append(dnsServers, &dns.Server{
+			PacketConn: udpConn, Handler: handler, SessionUDPFactory: sessionUDPFactory,
+			// Net & Addr are only set for logging purposes and aren't used if using ActivateAndServe.
+			Net: ipFamily.UDPAddress, Addr: udpConn.LocalAddr().String(),
+		})
 	}
 
-	return conn.(*net.UDPConn), listener.(*net.TCPListener), nil
+	return dnsServers, bindPort, nil
+}
+
+func evaluateAddress(address string, port uint16, bindPort uint16, ipFamily ipfamily.IPFamily) string {
+	// If the address is ever changed, ensure that the change is also reflected
+	// where the proxy bind address is referenced in the iptables rules. See
+	// (*IptablesManager).doGetProxyPort().
+
+	addr := ipFamily.Localhost
+
+	if address != "" {
+		addr = address
+	}
+
+	if bindPort == 0 {
+		return net.JoinHostPort(addr, strconv.Itoa(int(port)))
+	} else {
+		// Already bound to a port by a previous server -> reuse same port
+		return net.JoinHostPort(addr, strconv.Itoa(int(bindPort)))
+	}
 }
 
 // shouldCompressResponse returns true when the response needs to be compressed
 // for a given request.
 // Originally, DNS was limited to 512 byte responses. EDNS0 allows for larger
 // sizes. In either case, responses can apply DNS compression, and the original
-// RFCs require clients to accept this. In miekg/dns there is a comment that BIND
+// RFCs require clients to accept this. In cilium/dns there is a comment that BIND
 // does not support compression, so we retain the ability to suppress this.
 func shouldCompressResponse(request, response *dns.Msg) bool {
 	ednsOptions := request.IsEdns0()

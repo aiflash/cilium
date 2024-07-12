@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_COMMON_H_
-#define __LIB_COMMON_H_
+#pragma once
 
 #include <bpf/ctx/ctx.h>
 #include <bpf/api.h>
@@ -12,10 +11,13 @@
 #include <linux/in.h>
 #include <linux/socket.h>
 
-#include "eth.h"
 #include "endian.h"
+#include "eth.h"
 #include "mono.h"
 #include "config.h"
+#include "tunnel.h"
+
+#include "source_info.h"
 
 #ifndef AF_INET
 #define AF_INET 2
@@ -46,9 +48,13 @@
 #define CONDITIONAL_PREALLOC BPF_F_NO_PREALLOC
 #endif
 
-#if defined(ENCAP_IFINDEX) || defined(ENABLE_EGRESS_GATEWAY) || \
+#if defined(ENABLE_EGRESS_GATEWAY)
+#define ENABLE_EGRESS_GATEWAY_COMMON
+#endif
+
+#if defined(ENCAP_IFINDEX) || defined(ENABLE_EGRESS_GATEWAY_COMMON) || \
     (defined(ENABLE_DSR) && DSR_ENCAP_MODE == DSR_ENCAP_GENEVE)
-#define HAVE_ENCAP
+#define HAVE_ENCAP	1
 
 /* NOT_VTEP_DST is passed to an encapsulation function when the
  * destination of the tunnel is not a VTEP.
@@ -59,18 +65,13 @@
 /* XFER_FLAGS that get transferred from XDP to SKB */
 enum {
 	XFER_PKT_NO_SVC		= (1 << 0),  /* Skip upper service handling. */
-	XFER_PKT_ENCAP		= (1 << 1),  /* needs encap, tunnel info is in metadata. */
+	XFER_UNUSED		= (1 << 1),
 	XFER_PKT_SNAT_DONE	= (1 << 2),  /* SNAT is done */
 };
 
 /* For use in ctx_get_xfer(), after XDP called ctx_move_xfer(). */
 enum {
 	XFER_FLAGS = 0,		/* XFER_PKT_* */
-	XFER_ENCAP_NODEID = 1,
-	XFER_ENCAP_SECLABEL = 2,
-	XFER_ENCAP_DSTID = 3,
-	XFER_ENCAP_PORT = 4,
-	XFER_ENCAP_ADDR = 5,
 };
 
 /* FIB errors from BPF neighbor map. */
@@ -120,19 +121,23 @@ enum {
 #define CILIUM_CALL_IPV6_CT_EGRESS		32
 #define CILIUM_CALL_SRV6_ENCAP			33
 #define CILIUM_CALL_SRV6_DECAP			34
-#define CILIUM_CALL_SRV6_REPLY			35
+/* Unused CILIUM_CALL_SRV6_REPLY		35 */
 #define CILIUM_CALL_IPV4_NODEPORT_NAT_INGRESS	36
 #define CILIUM_CALL_IPV6_NODEPORT_NAT_INGRESS	37
 #define CILIUM_CALL_IPV4_NODEPORT_SNAT_FWD	38
 #define CILIUM_CALL_IPV6_NODEPORT_SNAT_FWD	39
-#define CILIUM_CALL_IPV4_NODEPORT_DSR_INGRESS	40
-#define CILIUM_CALL_IPV6_NODEPORT_DSR_INGRESS	41
+/* Unused CILIUM_CALL_IPV4_NODEPORT_DSR_INGRESS	40
+ * Unused CILIUM_CALL_IPV6_NODEPORT_DSR_INGRESS	41
+ */
 #define CILIUM_CALL_IPV4_INTER_CLUSTER_REVSNAT	42
 #define CILIUM_CALL_IPV4_CONT_FROM_HOST		43
 #define CILIUM_CALL_IPV4_CONT_FROM_NETDEV	44
 #define CILIUM_CALL_IPV6_CONT_FROM_HOST		45
 #define CILIUM_CALL_IPV6_CONT_FROM_NETDEV	46
-#define CILIUM_CALL_SIZE			47
+#define CILIUM_CALL_IPV4_NO_SERVICE		47
+#define CILIUM_CALL_IPV6_NO_SERVICE		48
+#define CILIUM_CALL_MULTICAST_EP_DELIVERY       49
+#define CILIUM_CALL_SIZE			50
 
 typedef __u64 mac_t;
 
@@ -150,12 +155,13 @@ union v6addr {
 	__u8 addr[16];
 } __packed;
 
-static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
-					       __u16 *proto)
+static __always_inline bool validate_ethertype_l2_off(struct __ctx_buff *ctx,
+						      int l2_off, __u16 *proto)
 {
-	void *data = ctx_data(ctx);
+	const __u64 tot_len = l2_off + ETH_HLEN;
 	void *data_end = ctx_data_end(ctx);
-	struct ethhdr *eth = data;
+	void *data = ctx_data(ctx);
+	struct ethhdr *eth;
 
 	if (ETH_HLEN == 0) {
 		/* The packet is received on L2-less device. Determine L3
@@ -165,20 +171,28 @@ static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
 		return true;
 	}
 
-	if (data + ETH_HLEN > data_end)
+	if (data + tot_len > data_end)
 		return false;
+
+	eth = data + l2_off;
+
 	*proto = eth->h_proto;
-	if (bpf_ntohs(*proto) < ETH_P_802_3_MIN)
-		return false; /* non-Ethernet II unsupported */
-	return true;
+
+	return eth_is_supported_ethertype(*proto);
+}
+
+static __always_inline bool validate_ethertype(struct __ctx_buff *ctx,
+					       __u16 *proto)
+{
+	return validate_ethertype_l2_off(ctx, 0, proto);
 }
 
 static __always_inline __maybe_unused bool
 ____revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
 			 void **l3, const __u32 l3_len, const bool pull,
-			 __u32 eth_hlen)
+			 __u32 l3_off)
 {
-	const __u64 tot_len = eth_hlen + l3_len;
+	const __u64 tot_len = l3_off + l3_len;
 	void *data_end;
 	void *data;
 
@@ -194,16 +208,41 @@ ____revalidate_data_pull(struct __ctx_buff *ctx, void **data_, void **data_end_,
 	*data_ = data;
 	*data_end_ = data_end;
 
-	*l3 = data + eth_hlen;
+	*l3 = data + l3_off;
 	return true;
 }
 
 static __always_inline __maybe_unused bool
 __revalidate_data_pull(struct __ctx_buff *ctx, void **data, void **data_end,
-		       void **l3, const __u32 l3_len, const bool pull)
+		       void **l3, const __u32 l3_off, const __u32 l3_len,
+		       const bool pull)
 {
 	return ____revalidate_data_pull(ctx, data, data_end, l3, l3_len, pull,
-					ETH_HLEN);
+					l3_off);
+}
+
+static __always_inline __u32 get_tunnel_id(__u32 identity)
+{
+#if defined ENABLE_IPV4 && defined ENABLE_IPV6
+	if (identity == WORLD_IPV4_ID || identity == WORLD_IPV6_ID)
+		return WORLD_ID;
+#endif
+	return identity;
+}
+
+static __always_inline __u32 get_id_from_tunnel_id(__u32 tunnel_id, __u16 proto  __maybe_unused)
+{
+#if defined ENABLE_IPV4 && defined ENABLE_IPV6
+	if (tunnel_id == WORLD_ID) {
+		switch (proto) {
+		case bpf_htons(ETH_P_IP):
+			return WORLD_IPV4_ID;
+		case bpf_htons(ETH_P_IPV6):
+			return WORLD_IPV6_ID;
+		}
+	}
+#endif
+	return tunnel_id;
 }
 
 /* revalidate_data_pull() initializes the provided pointers from the ctx and
@@ -214,31 +253,25 @@ __revalidate_data_pull(struct __ctx_buff *ctx, void **data, void **data_end,
  * false otherwise.
  */
 #define revalidate_data_pull(ctx, data, data_end, ip)			\
-	__revalidate_data_pull(ctx, data, data_end, (void **)ip, sizeof(**ip), true)
+	__revalidate_data_pull(ctx, data, data_end, (void **)ip, ETH_HLEN, sizeof(**ip), true)
 
-/* revalidate_data_maybe_pull() does the same as revalidate_data_pull()
- * except that the skb data pull is controlled by the "pull" argument.
- */
-#define revalidate_data_maybe_pull(ctx, data, data_end, ip, pull)	\
-	__revalidate_data_pull(ctx, data, data_end, (void **)ip, sizeof(**ip), pull)
-
+#define revalidate_data_l3_off(ctx, data, data_end, ip, l3_off)		\
+	__revalidate_data_pull(ctx, data, data_end, (void **)ip, l3_off, sizeof(**ip), false)
 
 /* revalidate_data() initializes the provided pointers from the ctx.
  * Returns true if 'ctx' is long enough for an IP header of the provided type,
  * false otherwise.
  */
 #define revalidate_data(ctx, data, data_end, ip)			\
-	__revalidate_data_pull(ctx, data, data_end, (void **)ip, sizeof(**ip), false)
+	revalidate_data_l3_off(ctx, data, data_end, ip, ETH_HLEN)
 
 /* Macros for working with L3 cilium defined IPV6 addresses */
 #define BPF_V6(dst, ...)	BPF_V6_1(dst, fetch_ipv6(__VA_ARGS__))
-#define BPF_V6_1(dst, ...)	BPF_V6_4(dst, __VA_ARGS__)
-#define BPF_V6_4(dst, a1, a2, a3, a4)		\
+#define BPF_V6_1(dst, ...)	BPF_V6_2(dst, __VA_ARGS__)
+#define BPF_V6_2(dst, a1, a2)		\
 	({					\
-		dst.p1 = a1;			\
-		dst.p2 = a2;			\
-		dst.p3 = a3;			\
-		dst.p4 = a4;			\
+		dst.d1 = a1;			\
+		dst.d2 = a2;			\
 	})
 
 #define ENDPOINT_KEY_IPV4 1
@@ -259,8 +292,7 @@ struct endpoint_key {
 	};
 	__u8 family;
 	__u8 key;
-	__u8 cluster_id;
-	__u8 pad;
+	__u16 cluster_id;
 } __packed;
 
 struct tunnel_key {
@@ -274,8 +306,8 @@ struct tunnel_key {
 		union v6addr	ip6;
 	};
 	__u8 family;
-	__u8 cluster_id;
-	__u16 pad;
+	__u8 pad;
+	__u16 cluster_id;
 } __packed;
 
 struct tunnel_value {
@@ -290,7 +322,7 @@ struct tunnel_value {
 	};
 	__u8 family;
 	__u8 key;
-	__u16 node_id;
+	__u16 pad;
 } __packed;
 
 #define ENDPOINT_F_HOST		1 /* Special endpoint representing local host */
@@ -299,11 +331,12 @@ struct tunnel_value {
 struct endpoint_info {
 	__u32		ifindex;
 	__u16		unused; /* used to be sec_label, no longer used */
-	__u16           lxc_id;
+	__u16		lxc_id;
 	__u32		flags;
 	mac_t		mac;
 	mac_t		node_mac;
-	__u32		pad[4];
+	__u32		sec_id;
+	__u32		pad[3];
 };
 
 struct edt_id {
@@ -320,8 +353,10 @@ struct edt_info {
 struct remote_endpoint_info {
 	__u32		sec_identity;
 	__u32		tunnel_endpoint;
-	__u16		node_id;
+	__u16		pad;
 	__u8		key;
+	__u8		flag_skip_tunnel:1,
+			pad2:7;
 };
 
 /*
@@ -372,7 +407,7 @@ struct policy_entry {
 struct auth_key {
 	__u32       local_sec_label;
 	__u32       remote_sec_label;
-	__u16       remote_node_id;
+	__u16       remote_node_id; /* zero for local node */
 	__u8        auth_type;
 	__u8        pad;
 };
@@ -387,13 +422,19 @@ struct auth_info {
  */
 enum {
 	RUNTIME_CONFIG_UTIME_OFFSET = 0, /* Index to Unix time offset in 512 ns units */
+	/* Last monotonic time, periodically set by the agent to
+	 * tell the datapath its still updating maps
+	 */
+	RUNTIME_CONFIG_AGENT_LIVENESS = 1,
 };
 
 struct metrics_key {
 	__u8      reason;	/* 0: forwarded, >0 dropped */
 	__u8      dir:2,	/* 1: ingress 2: egress */
 		  pad:6;
-	__u16     reserved[3];	/* reserved for future extension */
+	__u16	  line;		/* __MAGIC_LINE__ */
+	__u8	  file;		/* __MAGIC_FILE__, needs to fit __source_file_name_to_id */
+	__u8	  reserved[3];	/* reserved for future extension */
 };
 
 
@@ -437,16 +478,6 @@ struct srv6_policy_key6 {
 	union v6addr dst_cidr;
 };
 
-struct srv6_ipv4_2tuple {
-	__u32 src;
-	__u32 dst;
-};
-
-struct srv6_ipv6_2tuple {
-	union v6addr src;
-	union v6addr dst;
-};
-
 struct vtep_key {
 	__u32 vtep_ip;
 };
@@ -454,6 +485,21 @@ struct vtep_key {
 struct vtep_value {
 	__u64 vtep_mac;
 	__u32 tunnel_endpoint;
+};
+
+struct node_key {
+	__u16 pad1;
+	__u8 pad2;
+	__u8 family;
+	union {
+		struct {
+			__u32 ip4;
+			__u32 pad4;
+			__u32 pad5;
+			__u32 pad6;
+		};
+		union v6addr ip6;
+	};
 };
 
 enum {
@@ -562,7 +608,7 @@ enum {
 #define DROP_INVALID_EXTHDR	-156
 #define DROP_FRAG_NOSUPPORT	-157
 #define DROP_NO_SERVICE		-158
-#define DROP_UNUSED8		-159 /* unused */
+#define DROP_UNSUPP_SERVICE_PROTO	-159
 #define DROP_NO_TUNNEL_ENDPOINT -160
 #define DROP_NAT_46X64_DISABLED	-161
 #define DROP_EDT_HORIZON	-162
@@ -589,7 +635,7 @@ enum {
 #define DROP_INVALID_VNI	-183
 #define DROP_INVALID_TC_BUFFER  -184
 #define DROP_NO_SID		-185
-#define DROP_MISSING_SRV6_STATE	-186
+#define DROP_MISSING_SRV6_STATE	-186 /* unused */
 #define DROP_NAT46		-187
 #define DROP_NAT64		-188
 #define DROP_POLICY_AUTH_REQUIRED	-189
@@ -598,8 +644,18 @@ enum {
 #define DROP_INVALID_CLUSTER_ID	-192
 #define DROP_DSR_ENCAP_UNSUPP_PROTO	-193
 #define DROP_NO_EGRESS_GATEWAY	-194
+#define DROP_UNENCRYPTED_TRAFFIC	-195
+#define DROP_TTL_EXCEEDED	-196
+#define DROP_NO_NODE_ID		-197
+#define DROP_RATE_LIMITED	-198
+#define DROP_IGMP_HANDLED	-199
+#define DROP_IGMP_SUBSCRIBED    -200
+#define DROP_MULTICAST_HANDLED  -201
+#define DROP_HOST_NOT_READY	-202
+#define DROP_EP_NOT_READY	-203
 
 #define NAT_PUNT_TO_STACK	DROP_NAT_NOT_NEEDED
+#define NAT_NEEDED		CTX_ACT_OK
 #define NAT_46X64_RECIRC	100
 
 /* Cilium metrics reasons for forwarding packets and other stats.
@@ -650,15 +706,22 @@ enum metric_dir {
  *    In the IPsec case this becomes the SPI on the wire.
  */
 #define MARK_MAGIC_HOST_MASK		0x0F00
+#define MARK_MAGIC_PROXY_TO_WORLD	0x0800
 #define MARK_MAGIC_PROXY_EGRESS_EPID	0x0900 /* mark carries source endpoint ID */
 #define MARK_MAGIC_PROXY_INGRESS	0x0A00
 #define MARK_MAGIC_PROXY_EGRESS		0x0B00
 #define MARK_MAGIC_HOST			0x0C00
 #define MARK_MAGIC_DECRYPT		0x0D00
+/* used to identify encrypted overlay traffic post decryption.
+ * therefore, SPI bit can be reused to not steal an additional magic mark value.
+ */
+#define MARK_MAGIC_DECRYPTED_OVERLAY	0x1D00
 #define MARK_MAGIC_ENCRYPT		0x0E00
 #define MARK_MAGIC_IDENTITY		0x0F00 /* mark carries identity */
 #define MARK_MAGIC_TO_PROXY		0x0200
 #define MARK_MAGIC_SNAT_DONE		0x0300
+#define MARK_MAGIC_OVERLAY		0x0400
+#define MARK_MAGIC_EGW_DONE		0x0500
 
 #define MARK_MAGIC_KEY_MASK		0xFF00
 
@@ -681,9 +744,12 @@ enum metric_dir {
  */
 #define MARK_MAGIC_HEALTH		MARK_MAGIC_DECRYPT
 
-/* Shouldn't interfere with MARK_MAGIC_TO_PROXY. Lower 8bits carries cluster_id */
+/* MARK_MAGIC_CLUSTER_ID shouldn't interfere with MARK_MAGIC_TO_PROXY. Lower
+ * 8bits carries cluster_id, and when extended via the 'max-connected-clusters'
+ * option, the upper 16bits may also be used for cluster_id, starting at the
+ * most significant bit.
+ */
 #define MARK_MAGIC_CLUSTER_ID		MARK_MAGIC_TO_PROXY
-#define MARK_MAGIC_CLUSTER_ID_MASK	0x00FF
 
 /* IPv4 option used to carry service addr and port for DSR.
  *
@@ -709,30 +775,6 @@ enum metric_dir {
 #define DSR_IPV6_OPT_LEN	(sizeof(struct dsr_opt_v6) - 4)
 #define DSR_IPV6_EXT_LEN	((sizeof(struct dsr_opt_v6) - 8) / 8)
 
-/* The high-order bit of the Geneve option type indicates that
- * this is a critical option.
- *
- * https://www.rfc-editor.org/rfc/rfc8926.html#name-tunnel-options
- */
-#define GENEVE_OPT_TYPE_CRIT	0x80
-
-/* Geneve option used to carry service addr and port for DSR.
- *
- * Class = 0x014B (Cilium according to [1])
- * Type  = 0x1   (vendor-specific)
- *
- * [1]: https://www.iana.org/assignments/nvo3/nvo3.xhtml#geneve-option-class
- */
-#define DSR_GENEVE_OPT_CLASS	0x014B
-#define DSR_GENEVE_OPT_TYPE	(GENEVE_OPT_TYPE_CRIT | 0x01)
-#define DSR_IPV4_GENEVE_OPT_LEN	\
-	((sizeof(struct geneve_dsr_opt4) - sizeof(struct geneve_opt_hdr)) / 4)
-#define DSR_IPV6_GENEVE_OPT_LEN	\
-	((sizeof(struct geneve_dsr_opt6) - sizeof(struct geneve_opt_hdr)) / 4)
-
-/* We cap key index at 4 bits because mark value is used to map ctx to key */
-#define MAX_KEY_INDEX 15
-
 /* encrypt_config is the current encryption context on the node */
 struct encrypt_config {
 	__u8 encrypt_key;
@@ -752,10 +794,10 @@ static __always_inline __u32 or_encrypt_key(__u8 key)
  * cilium_host @egress
  *   bpf_host -> bpf_lxc
  */
-#define TC_INDEX_F_SKIP_INGRESS_PROXY	1
-#define TC_INDEX_F_SKIP_EGRESS_PROXY	2
+#define TC_INDEX_F_FROM_INGRESS_PROXY	1
+#define TC_INDEX_F_FROM_EGRESS_PROXY	2
 #define TC_INDEX_F_SKIP_NODEPORT	4
-#define TC_INDEX_F_SKIP_RECIRCULATION	8
+#define TC_INDEX_F_UNUSED		8
 #define TC_INDEX_F_SKIP_HOST_FIREWALL	16
 
 /*
@@ -776,25 +818,26 @@ enum {
 #define	CB_ENCRYPT_MAGIC	CB_SRC_LABEL	/* Alias, non-overlapping */
 #define	CB_DST_ENDPOINT_ID	CB_SRC_LABEL    /* Alias, non-overlapping */
 #define CB_SRV6_SID_1		CB_SRC_LABEL	/* Alias, non-overlapping */
-#define CB_ENCAP_NODEID		CB_SRC_LABEL	/* XDP */
 	CB_IFINDEX,
 #define	CB_NAT_46X64		CB_IFINDEX	/* Alias, non-overlapping */
 #define	CB_ADDR_V4		CB_IFINDEX	/* Alias, non-overlapping */
 #define	CB_ADDR_V6_1		CB_IFINDEX	/* Alias, non-overlapping */
 #define	CB_IPCACHE_SRC_LABEL	CB_IFINDEX	/* Alias, non-overlapping */
 #define CB_SRV6_SID_2		CB_IFINDEX	/* Alias, non-overlapping */
-#define CB_ENCAP_SECLABEL	CB_IFINDEX	/* XDP */
 #define CB_CLUSTER_ID_EGRESS	CB_IFINDEX	/* Alias, non-overlapping */
+#define CB_HSIPC_ADDR_V4	CB_IFINDEX	/* Alias, non-overlapping */
+#define CB_TRACED		CB_IFINDEX	/* Alias, non-overlapping */
 	CB_POLICY,
 #define	CB_ADDR_V6_2		CB_POLICY	/* Alias, non-overlapping */
 #define CB_SRV6_SID_3		CB_POLICY	/* Alias, non-overlapping */
-#define CB_ENCAP_DSTID		CB_POLICY	/* XDP */
 #define	CB_CLUSTER_ID_INGRESS	CB_POLICY	/* Alias, non-overlapping */
-	CB_NAT,
-#define	CB_ADDR_V6_3		CB_NAT		/* Alias, non-overlapping */
-#define	CB_FROM_HOST		CB_NAT		/* Alias, non-overlapping */
-#define CB_SRV6_SID_4		CB_NAT		/* Alias, non-overlapping */
-#define CB_ENCAP_PORT		CB_NAT		/* XDP */
+#define CB_HSIPC_PORT		CB_POLICY	/* Alias, non-overlapping */
+#define CB_DSR_SRC_LABEL	CB_POLICY	/* Alias, non-overlapping */
+	CB_3,
+#define	CB_ADDR_V6_3		CB_3		/* Alias, non-overlapping */
+#define	CB_FROM_HOST		CB_3		/* Alias, non-overlapping */
+#define CB_SRV6_SID_4		CB_3		/* Alias, non-overlapping */
+#define CB_DSR_L3_OFF		CB_3		/* Alias, non-overlapping */
 	CB_CT_STATE,
 #define	CB_ADDR_V6_4		CB_CT_STATE	/* Alias, non-overlapping */
 #define	CB_ENCRYPT_IDENTITY	CB_CT_STATE	/* Alias, non-overlapping,
@@ -803,7 +846,6 @@ enum {
 #define	CB_CUSTOM_CALLS		CB_CT_STATE	/* Alias, non-overlapping */
 #define	CB_SRV6_VRF_ID		CB_CT_STATE	/* Alias, non-overlapping */
 #define	CB_FROM_TUNNEL		CB_CT_STATE	/* Alias, non-overlapping */
-#define CB_ENCAP_ADDR		CB_CT_STATE /* XDP */
 };
 
 /* Magic values for CB_FROM_HOST.
@@ -834,7 +876,6 @@ enum ct_status {
 	CT_ESTABLISHED,
 	CT_REPLY,
 	CT_RELATED,
-	CT_REOPENED,
 } __packed;
 
 /* Service flags (lb{4,6}_service->flags) */
@@ -857,6 +898,7 @@ enum {
 	SVC_FLAG_LOOPBACK       = (1 << 3),  /* hostport with a loopback hostIP */
 	SVC_FLAG_INT_LOCAL_SCOPE = (1 << 4), /* internalTrafficPolicy=Local */
 	SVC_FLAG_TWO_SCOPES     = (1 << 5),  /* two sets of backends are used for external/internal connections */
+	SVC_FLAG_QUARANTINED    = (1 << 6),  /* Backend slot (key: backend_slot > 0) is quarantined */
 };
 
 /* Backend flags (lb{4,6}_backends->flags) */
@@ -898,33 +940,27 @@ struct ipv4_ct_tuple {
 } __packed;
 
 struct ct_entry {
-	__u64 rx_packets;
-	/* Previously, the rx_bytes field was not used for entries with
-	 * the dir=CT_SERVICE (see GH#7060). Therefore, we can safely abuse
-	 * this field to save the backend_id.
-	 */
-	union {
-		__u64 rx_bytes;
-		__u64 backend_id;
-	};
-	__u64 tx_packets;
-	__u64 tx_bytes;
+	__u64 reserved0;	/* unused since v1.16 */
+	__u64 backend_id;
+	__u64 packets;
+	__u64 bytes;
 	__u32 lifetime;
 	__u16 rx_closing:1,
 	      tx_closing:1,
-	      nat46:1,
+	      reserved1:1,	/* unused since v1.12 */
 	      lb_loopback:1,
 	      seen_non_syn:1,
 	      node_port:1,
-	      proxy_redirect:1, /* Connection is redirected to a proxy */
-	      dsr:1,
-	      from_l7lb:1, /* Connection is originated from an L7 LB proxy */
-	      reserved1:1, /* Was auth_required, not used in production anywhere */
-	      from_tunnel:1, /* Connection is over tunnel */
-	      reserved:5;
+	      proxy_redirect:1,	/* Connection is redirected to a proxy */
+	      dsr_internal:1,	/* DSR is k8s service related, cluster internal */
+	      from_l7lb:1,	/* Connection is originated from an L7 LB proxy */
+	      reserved2:1,	/* unused since v1.14 */
+	      from_tunnel:1,	/* Connection is over tunnel */
+	      reserved3:5;
 	__u16 rev_nat_index;
 	/* In the kernel ifindex is u32, so we need to check in cilium-agent
 	 * that ifindex of a NodePort device is <= MAX(u16).
+	 * Unused when HAVE_FIB_INDEX is available.
 	 */
 	__u16 ifindex;
 
@@ -963,7 +999,10 @@ struct lb6_service {
 	__u16 rev_nat_index;
 	__u8 flags;
 	__u8 flags2;
-	__u8 pad[2];
+	/* For the service frontend, qcount denotes number of service backend
+	 * slots under quarantine (otherwise zero).
+	 */
+	__u16 qcount;
 };
 
 /* See lb4_backend comments */
@@ -972,11 +1011,12 @@ struct lb6_backend {
 	__be16 port;
 	__u8 proto;
 	__u8 flags;
-	__u8 cluster_id;	/* With this field, we can distinguish two
+	__u16 cluster_id;	/* With this field, we can distinguish two
 				 * backends that have the same IP address,
 				 * but belong to the different cluster.
 				 */
-	__u8 pad[3];
+	__u8 zone;
+	__u8 pad;
 };
 
 struct lb6_health {
@@ -1023,7 +1063,10 @@ struct lb4_service {
 	__u16 rev_nat_index;	/* Reverse NAT ID in lb4_reverse_nat */
 	__u8 flags;
 	__u8 flags2;
-	__u8  pad[2];
+	/* For the service frontend, qcount denotes number of service backend
+	 * slots under quarantine (otherwise zero).
+	 */
+	__u16 qcount;
 };
 
 struct lb4_backend {
@@ -1031,11 +1074,12 @@ struct lb4_backend {
 	__be16 port;		/* L4 port filter */
 	__u8 proto;		/* L4 protocol, currently not used (set to 0) */
 	__u8 flags;
-	__u8 cluster_id;	/* With this field, we can distinguish two
+	__u16 cluster_id;	/* With this field, we can distinguish two
 				 * backends that have the same IP address,
 				 * but belong to the different cluster.
 				 */
-	__u8 pad[3];
+	__u8 zone;
+	__u8 pad;
 };
 
 struct lb4_health {
@@ -1102,19 +1146,24 @@ struct lb_affinity_match {
 
 struct ct_state {
 	__u16 rev_nat_index;
+#ifndef DISABLE_LOOPBACK_LB
 	__u16 loopback:1,
+#else
+	__u16 loopback_disabled:1,
+#endif
 	      node_port:1,
-	      dsr:1,
+	      dsr_internal:1,   /* DSR is k8s service related, cluster internal */
 	      syn:1,
 	      proxy_redirect:1,	/* Connection is redirected to a proxy */
 	      from_l7lb:1,	/* Connection is originated from an L7 LB proxy */
 	      reserved1:1,	/* Was auth_required, not used in production anywhere */
 	      from_tunnel:1,	/* Connection is from tunnel */
-	      reserved:8;
-	__be32 addr;
-	__be32 svc_addr;
+		  closing:1,
+	      reserved:7;
 	__u32 src_sec_id;
+#ifndef HAVE_FIB_IFINDEX
 	__u16 ifindex;
+#endif
 	__u32 backend_id;	/* Backend ID in lb4_backends */
 };
 
@@ -1146,24 +1195,37 @@ struct lb6_src_range_key {
 
 static __always_inline int redirect_ep(struct __ctx_buff *ctx __maybe_unused,
 				       int ifindex __maybe_unused,
-				       bool needs_backlog __maybe_unused)
+				       bool needs_backlog __maybe_unused,
+				       bool from_tunnel)
 {
 	/* Going via CPU backlog queue (aka needs_backlog) is required
 	 * whenever we cannot do a fast ingress -> ingress switch but
 	 * instead need an ingress -> egress netns traversal or vice
 	 * versa.
+	 *
+	 * This is also the case if BPF host routing is disabled, or if
+	 * we are currently on egress which is indicated by ingress_ifindex
+	 * being 0. The latter is cleared upon skb scrubbing.
+	 *
+	 * In case of netkit, we're on the egress side and need a regular
+	 * redirect to the peer device's ifindex. In case of veth we're
+	 * on ingress and need a redirect peer to get to the target. Both
+	 * only traverse the CPU backlog queue once. In case of phys ->
+	 * Pod, the ingress_ifindex is > 0 and in both device types we
+	 * do want a redirect peer into the target Pod's netns.
 	 */
-	if (needs_backlog || !is_defined(ENABLE_HOST_ROUTING)) {
+	if (needs_backlog || !is_defined(ENABLE_HOST_ROUTING) ||
+	    ctx_get_ingress_ifindex(ctx) == 0) {
 		return ctx_redirect(ctx, ifindex, 0);
-	} else {
-# ifdef HAVE_ENCAP
-		/* When coming from overlay, we need to set packet type
-		 * to HOST as otherwise we might get dropped in IP layer.
-		 */
-		ctx_change_type(ctx, PACKET_HOST);
-# endif /* HAVE_ENCAP */
-		return ctx_redirect_peer(ctx, ifindex, 0);
 	}
+
+	/* When coming from overlay, we need to set packet type
+	 * to HOST as otherwise we might get dropped in IP layer.
+	 */
+	if (from_tunnel)
+		ctx_change_type(ctx, PACKET_HOST);
+
+	return ctx_redirect_peer(ctx, ifindex, 0);
 }
 
 static __always_inline __u64 ctx_adjust_hroom_flags(void)
@@ -1190,51 +1252,24 @@ struct lpm_val {
 	__u8 flags;
 };
 
-struct geneve_opt_hdr {
-	__be16 opt_class;
-	__u8 type;
-#ifdef __LITTLE_ENDIAN_BITFIELD
-	__u8 length:5,
-	     rsvd:3;
-#else
-	__u8 rsvd:3,
-	     length:5;
-#endif
+struct skip_lb4_key {
+	__u64 netns_cookie;     /* Source pod netns cookie */
+	__u32 address;          /* Destination service virtual IPv4 address */
+	__u16 port;             /* Destination service virtual layer4 port */
+	__u16 pad;
 };
 
-struct geneve_dsr_opt4 {
-	struct geneve_opt_hdr hdr;
-	__be32	addr;
-	__be16	port;
-	__u16	pad;
+struct skip_lb6_key {
+	__u64 netns_cookie;     /* Source pod netns cookie */
+	union v6addr address;   /* Destination service virtual IPv6 address */
+	__u32 pad;
+	__u16 port;             /* Destination service virtual layer4 port */
+	__u16 pad2;
 };
 
-struct geneve_dsr_opt6 {
-	struct geneve_opt_hdr hdr;
-	union v6addr addr;
-	__be16	port;
-	__u16	pad;
-};
-
-struct genevehdr {
-#ifdef __LITTLE_ENDIAN_BITFIELD
-	__u8 opt_len:6,
-	     ver:2;
-	__u8 rsvd:6,
-	     critical:1,
-	     control:1;
-#else
-	__u8 ver:2,
-	     opt_len:6;
-	__u8 control:1,
-	     critical:1,
-	     rsvd:6;
-#endif
-	__be16 protocol_type;
-	__u8 vni[3];
-	__u8 reserved;
-};
+/* Older kernels don't support the larger tunnel key structure and we don't
+ * need it since we only want to retrieve the tunnel ID anyway.
+ */
+#define TUNNEL_KEY_WITHOUT_SRC_IP offsetof(struct bpf_tunnel_key, local_ipv4)
 
 #include "overloadable.h"
-
-#endif /* __LIB_COMMON_H_ */

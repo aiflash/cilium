@@ -82,10 +82,13 @@ get started and experiment with Cilium.
    network/ebpf/index
    network/clustermesh/index
    network/external-toc
+   network/egress-gateway-toc
    network/servicemesh/index
-   network/istio
    network/vtep
-   network/lb-ipam
+   network/l2-announcements
+   network/node-ipam
+   network/pod-mac-address
+   network/multicast
 
 .. toctree::
    :maxdepth: 2
@@ -104,6 +107,7 @@ get started and experiment with Cilium.
    observability/grafana
    observability/metrics
    observability/visibility
+   observability/hubble-exporter
 
 .. toctree::
    :maxdepth: 2
@@ -119,7 +123,7 @@ get started and experiment with Cilium.
    :maxdepth: 2
    :caption: Community
 
-   community/governance/index
+   community/governance
    community/community
    community/roadmap
 

@@ -4,6 +4,10 @@ kind: Role
 metadata:
   name: clustermesh-apiserver-generate-certs
   namespace: {{ .Release.Namespace }}
+  {{- with .Values.clustermesh.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   labels:
     app.kubernetes.io/part-of: cilium
 rules:
@@ -19,7 +23,6 @@ rules:
       - secrets
     resourceNames:
       - cilium-ca
-      - clustermesh-apiserver-ca-cert
     verbs:
       - get
       - update
@@ -31,6 +34,7 @@ rules:
       - clustermesh-apiserver-server-cert
       - clustermesh-apiserver-admin-cert
       - clustermesh-apiserver-remote-cert
+      - clustermesh-apiserver-local-cert
       - clustermesh-apiserver-client-cert
     verbs:
       - update

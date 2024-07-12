@@ -25,12 +25,9 @@ type NodeAddressingFamily interface {
 	// on the node
 	AllocationCIDR() *cidr.CIDR
 
-	// LocalAddresses lists all local addresses
-	LocalAddresses() ([]net.IP, error)
-
-	// LoadBalancerNodeAddresses lists all addresses on which HostPort and
-	// NodePort services should be responded to
-	LoadBalancerNodeAddresses() []net.IP
+	// DirectRouting returns the interface index and IP address for
+	// direct routing.
+	DirectRouting() (int, net.IP, bool)
 }
 
 // NodeAddressing implements addressing of a node

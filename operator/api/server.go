@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"syscall"
 
+	"github.com/cilium/hive/cell"
 	"github.com/go-openapi/loads"
 	"github.com/go-openapi/runtime"
 	"github.com/sirupsen/logrus"
@@ -17,11 +18,11 @@ import (
 
 	operatorApi "github.com/cilium/cilium/api/v1/operator/server"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi"
+	"github.com/cilium/cilium/api/v1/operator/server/restapi/cluster"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/metrics"
 	"github.com/cilium/cilium/api/v1/operator/server/restapi/operator"
 	"github.com/cilium/cilium/pkg/api"
 	"github.com/cilium/cilium/pkg/hive"
-	"github.com/cilium/cilium/pkg/hive/cell"
 )
 
 type Server interface {
@@ -38,10 +39,11 @@ type params struct {
 
 	HealthHandler   operator.GetHealthzHandler
 	MetricsHandler  metrics.GetMetricsHandler
+	ClusterHandler  cluster.GetClusterHandler
 	OperatorAPISpec *operatorApi.Spec
 
 	Logger     logrus.FieldLogger
-	Lifecycle  hive.Lifecycle
+	Lifecycle  cell.Lifecycle
 	Shutdowner hive.Shutdowner
 }
 
@@ -56,6 +58,7 @@ type server struct {
 
 	healthHandler  operator.GetHealthzHandler
 	metricsHandler metrics.GetMetricsHandler
+	clusterHandler cluster.GetClusterHandler
 	apiSpec        *operatorApi.Spec
 }
 
@@ -74,6 +77,7 @@ func newServer(
 		address:        p.Cfg.OperatorAPIServeAddr,
 		healthHandler:  p.HealthHandler,
 		metricsHandler: p.MetricsHandler,
+		clusterHandler: p.ClusterHandler,
 		apiSpec:        p.OperatorAPISpec,
 	}
 	p.Lifecycle.Append(server)
@@ -81,7 +85,7 @@ func newServer(
 	return server, nil
 }
 
-func (s *server) Start(ctx hive.HookContext) error {
+func (s *server) Start(ctx cell.HookContext) error {
 	spec, err := loads.Analyzed(operatorApi.SwaggerJSON, "")
 	if err != nil {
 		return err
@@ -91,6 +95,7 @@ func (s *server) Start(ctx hive.HookContext) error {
 	restAPI.Logger = s.logger.Debugf
 	restAPI.OperatorGetHealthzHandler = s.healthHandler
 	restAPI.MetricsGetMetricsHandler = s.metricsHandler
+	restAPI.ClusterGetClusterHandler = s.clusterHandler
 
 	api.DisableAPIs(s.apiSpec.DeniedAPIs, restAPI.AddMiddlewareFor)
 	srv := operatorApi.NewServer(restAPI)
@@ -100,7 +105,7 @@ func (s *server) Start(ctx hive.HookContext) error {
 
 	mux := http.NewServeMux()
 
-	// Index handler is the the handler for Open-API router.
+	// Index handler is the handler for Open-API router.
 	mux.Handle("/", s.Server.GetHandler())
 	// Create a custom handler for /healthz as an alias to /v1/healthz. A http mux
 	// is required for this because open-api spec does not allow multiple base paths
@@ -172,7 +177,7 @@ func (s *server) Start(ctx hive.HookContext) error {
 // setsockoptReuseAddrAndPort sets the SO_REUSEADDR and SO_REUSEPORT socket options on c's
 // underlying socket in order to improve the chance to re-bind to the same address and port
 // upon restart.
-func (s *server) Stop(ctx hive.HookContext) error {
+func (s *server) Stop(ctx cell.HookContext) error {
 	for _, srv := range s.httpSrvs {
 		if srv.server == nil {
 			continue

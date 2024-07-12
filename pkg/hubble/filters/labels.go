@@ -6,7 +6,6 @@ package filters
 import (
 	"context"
 	"fmt"
-	"regexp"
 
 	flowpb "github.com/cilium/cilium/api/v1/flow"
 	v1 "github.com/cilium/cilium/pkg/hubble/api/v1"
@@ -24,9 +23,10 @@ func destinationLabels(ev *v1.Event) k8sLabels.Labels {
 	return ciliumLabels.ParseLabelArrayFromArray(labels)
 }
 
-var (
-	labelSelectorWithColon = regexp.MustCompile(`([^,]\s*[a-z0-9-]+):([a-z0-9-]+)`)
-)
+func nodeLabels(ev *v1.Event) k8sLabels.Labels {
+	labels := ev.GetFlow().GetNodeLabels()
+	return ciliumLabels.ParseLabelArrayFromArray(labels)
+}
 
 func parseSelector(selector string) (k8sLabels.Selector, error) {
 	// ciliumLabels.LabelArray extends the k8sLabels.Selector logic with
@@ -39,8 +39,13 @@ func parseSelector(selector string) (k8sLabels.Selector, error) {
 	// therefore we translate any user-specified source prefixes by
 	// replacing colon-based source prefixes in labels with dot-based prefixes,
 	// i.e. "k8s:foo in (bar, baz)" becomes "k8s.foo in (bar, baz)".
-
-	translated := labelSelectorWithColon.ReplaceAllString(selector, "${1}.${2}")
+	//
+	// We also prefix any key that doesn ot specify with "any."
+	// i.e. "example.com in (bar, buzz)" becomes "any.example.com in (bar, buzz)"
+	translated, err := translateSelector(selector)
+	if err != nil {
+		return nil, err
+	}
 	return k8sLabels.Parse(translated)
 }
 
@@ -77,7 +82,7 @@ func (l *LabelsFilter) OnBuildFilter(ctx context.Context, ff *flowpb.FlowFilter)
 	if ff.GetSourceLabel() != nil {
 		slf, err := FilterByLabelSelectors(ff.GetSourceLabel(), sourceLabels)
 		if err != nil {
-			return nil, fmt.Errorf("invalid source label filter: %v", err)
+			return nil, fmt.Errorf("invalid source label filter: %w", err)
 		}
 		fs = append(fs, slf)
 	}
@@ -85,9 +90,17 @@ func (l *LabelsFilter) OnBuildFilter(ctx context.Context, ff *flowpb.FlowFilter)
 	if ff.GetDestinationLabel() != nil {
 		dlf, err := FilterByLabelSelectors(ff.GetDestinationLabel(), destinationLabels)
 		if err != nil {
-			return nil, fmt.Errorf("invalid destination label filter: %v", err)
+			return nil, fmt.Errorf("invalid destination label filter: %w", err)
 		}
 		fs = append(fs, dlf)
+	}
+
+	if ff.GetNodeLabels() != nil {
+		nlf, err := FilterByLabelSelectors(ff.GetNodeLabels(), nodeLabels)
+		if err != nil {
+			return nil, fmt.Errorf("invalid node label filter: %w", err)
+		}
+		fs = append(fs, nlf)
 	}
 
 	return fs, nil

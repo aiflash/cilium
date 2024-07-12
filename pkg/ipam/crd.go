@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -32,8 +31,10 @@ import (
 	"github.com/cilium/cilium/pkg/k8s/utils"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/node"
 	nodeTypes "github.com/cilium/cilium/pkg/node/types"
 	"github.com/cilium/cilium/pkg/option"
+	"github.com/cilium/cilium/pkg/time"
 	"github.com/cilium/cilium/pkg/trigger"
 )
 
@@ -72,13 +73,13 @@ type nodeStore struct {
 
 	clientset client.Clientset
 
-	conf      Configuration
+	conf      *option.DaemonConfig
 	mtuConfig MtuConfiguration
 }
 
 // newNodeStore initializes a new store which reflects the CiliumNode custom
 // resource of the specified node name
-func newNodeStore(nodeName string, conf Configuration, owner Owner, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration) *nodeStore {
+func newNodeStore(nodeName string, conf *option.DaemonConfig, owner Owner, localNodeStore *node.LocalNodeStore, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration) *nodeStore {
 	log.WithField(fieldName, nodeName).Info("Subscribed to CiliumNode custom resource")
 
 	store := &nodeStore{
@@ -92,7 +93,7 @@ func newNodeStore(nodeName string, conf Configuration, owner Owner, clientset cl
 
 	t, err := trigger.NewTrigger(trigger.Parameters{
 		Name:        "crd-allocator-node-refresher",
-		MinInterval: option.Config.IPAMCiliumNodeUpdateRate,
+		MinInterval: conf.IPAMCiliumNodeUpdateRate,
 		TriggerFunc: store.refreshNodeTrigger,
 	})
 	if err != nil {
@@ -173,7 +174,7 @@ func newNodeStore(nodeName string, conf Configuration, owner Owner, clientset cl
 	}
 
 	for {
-		minimumReached, required, numAvailable := store.hasMinimumIPsInPool()
+		minimumReached, required, numAvailable := store.hasMinimumIPsInPool(localNodeStore)
 		logFields := logrus.Fields{
 			fieldName:   nodeName,
 			"required":  required,
@@ -202,30 +203,26 @@ func newNodeStore(nodeName string, conf Configuration, owner Owner, clientset cl
 }
 
 func deriveVpcCIDRs(node *ciliumv2.CiliumNode) (primaryCIDR *cidr.CIDR, secondaryCIDRs []*cidr.CIDR) {
-	if len(node.Status.ENI.ENIs) > 0 {
-		// A node belongs to a single VPC so we can pick the first ENI
-		// in the list and derive the VPC CIDR from it.
-		for _, eni := range node.Status.ENI.ENIs {
-			c, err := cidr.ParseCIDR(eni.VPC.PrimaryCIDR)
-			if err == nil {
-				primaryCIDR = c
-				for _, sc := range eni.VPC.CIDRs {
-					c, err = cidr.ParseCIDR(sc)
-					if err == nil {
-						secondaryCIDRs = append(secondaryCIDRs, c)
-					}
+	// A node belongs to a single VPC so we can pick the first ENI
+	// in the list and derive the VPC CIDR from it.
+	for _, eni := range node.Status.ENI.ENIs {
+		c, err := cidr.ParseCIDR(eni.VPC.PrimaryCIDR)
+		if err == nil {
+			primaryCIDR = c
+			for _, sc := range eni.VPC.CIDRs {
+				c, err = cidr.ParseCIDR(sc)
+				if err == nil {
+					secondaryCIDRs = append(secondaryCIDRs, c)
 				}
-				return
 			}
+			return
 		}
 	}
-	if len(node.Status.Azure.Interfaces) > 0 {
-		for _, azif := range node.Status.Azure.Interfaces {
-			c, err := cidr.ParseCIDR(azif.CIDR)
-			if err == nil {
-				primaryCIDR = c
-				return
-			}
+	for _, azif := range node.Status.Azure.Interfaces {
+		c, err := cidr.ParseCIDR(azif.CIDR)
+		if err == nil {
+			primaryCIDR = c
+			return
 		}
 	}
 	// return AlibabaCloud vpc CIDR
@@ -233,13 +230,21 @@ func deriveVpcCIDRs(node *ciliumv2.CiliumNode) (primaryCIDR *cidr.CIDR, secondar
 		c, err := cidr.ParseCIDR(node.Spec.AlibabaCloud.CIDRBlock)
 		if err == nil {
 			primaryCIDR = c
+		}
+		for _, eni := range node.Status.AlibabaCloud.ENIs {
+			for _, sc := range eni.VPC.SecondaryCIDRs {
+				c, err = cidr.ParseCIDR(sc)
+				if err == nil {
+					secondaryCIDRs = append(secondaryCIDRs, c)
+				}
+			}
 			return
 		}
 	}
 	return
 }
 
-func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR() bool {
+func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR(localNodeStore *node.LocalNodeStore) bool {
 	if primaryCIDR, secondaryCIDRs := deriveVpcCIDRs(n.ownNode); primaryCIDR != nil {
 		allCIDRs := append([]*cidr.CIDR{primaryCIDR}, secondaryCIDRs...)
 		if nativeCIDR := n.conf.GetIPv4NativeRoutingCIDR(); nativeCIDR != nil {
@@ -266,7 +271,9 @@ func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR() bool {
 			log.WithFields(logrus.Fields{
 				"vpc-cidr": primaryCIDR.String(),
 			}).Info("Using autodetected primary VPC CIDR.")
-			n.conf.SetIPv4NativeRoutingCIDR(primaryCIDR)
+			localNodeStore.Update(func(n *node.LocalNode) {
+				n.IPv4NativeRoutingCIDR = primaryCIDR
+			})
 		}
 		return true
 	} else {
@@ -278,7 +285,7 @@ func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR() bool {
 // hasMinimumIPsInPool returns true if the required number of IPs is available
 // in the allocation pool. It also returns the number of IPs required and
 // available.
-func (n *nodeStore) hasMinimumIPsInPool() (minimumReached bool, required, numAvailable int) {
+func (n *nodeStore) hasMinimumIPsInPool(localNodeStore *node.LocalNodeStore) (minimumReached bool, required, numAvailable int) {
 	n.mutex.RLock()
 	defer n.mutex.RUnlock()
 
@@ -308,7 +315,7 @@ func (n *nodeStore) hasMinimumIPsInPool() (minimumReached bool, required, numAva
 		}
 
 		if n.conf.IPAMMode() == ipamOption.IPAMENI || n.conf.IPAMMode() == ipamOption.IPAMAzure || n.conf.IPAMMode() == ipamOption.IPAMAlibabaCloud {
-			if !n.autoDetectIPv4NativeRoutingCIDR() {
+			if !n.autoDetectIPv4NativeRoutingCIDR(localNodeStore) {
 				minimumReached = false
 			}
 		}
@@ -341,14 +348,12 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 	n.ownNode = node
 	n.allocationPoolSize[IPv4] = 0
 	n.allocationPoolSize[IPv6] = 0
-	if node.Spec.IPAM.Pool != nil {
-		for ipString := range node.Spec.IPAM.Pool {
-			if ip := net.ParseIP(ipString); ip != nil {
-				if ip.To4() != nil {
-					n.allocationPoolSize[IPv4]++
-				} else {
-					n.allocationPoolSize[IPv6]++
-				}
+	for ipString := range node.Spec.IPAM.Pool {
+		if ip := net.ParseIP(ipString); ip != nil {
+			if ip.To4() != nil {
+				n.allocationPoolSize[IPv4]++
+			} else {
+				n.allocationPoolSize[IPv6]++
 			}
 		}
 	}
@@ -625,13 +630,13 @@ type crdAllocator struct {
 	// family is the address family this allocator is allocator for
 	family Family
 
-	conf Configuration
+	conf *option.DaemonConfig
 }
 
 // newCRDAllocator creates a new CRD-backed IP allocator
-func newCRDAllocator(family Family, c Configuration, owner Owner, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration) Allocator {
+func newCRDAllocator(family Family, c *option.DaemonConfig, owner Owner, localNodeStore *node.LocalNodeStore, clientset client.Clientset, k8sEventReg K8sEventRegister, mtuConfig MtuConfiguration) Allocator {
 	initNodeStore.Do(func() {
-		sharedNodeStore = newNodeStore(nodeTypes.GetName(), c, owner, clientset, k8sEventReg, mtuConfig)
+		sharedNodeStore = newNodeStore(nodeTypes.GetName(), c, owner, localNodeStore, clientset, k8sEventReg, mtuConfig)
 	})
 
 	allocator := &crdAllocator{
@@ -869,17 +874,23 @@ func (a *crdAllocator) AllocateNextWithoutSyncUpstream(owner string, pool Pool) 
 }
 
 // Dump provides a status report and lists all allocated IP addresses
-func (a *crdAllocator) Dump() (map[string]string, string) {
+func (a *crdAllocator) Dump() (map[Pool]map[string]string, string) {
 	a.mutex.RLock()
 	defer a.mutex.RUnlock()
 
-	allocs := map[string]string{}
+	allocs := make(map[string]string, len(a.allocated))
 	for ip := range a.allocated {
 		allocs[ip] = ""
 	}
 
 	status := fmt.Sprintf("%d/%d allocated", len(allocs), a.store.totalPoolSize(a.family))
-	return allocs, status
+	return map[Pool]map[string]string{PoolDefault(): allocs}, status
+}
+
+func (a *crdAllocator) Capacity() uint64 {
+	a.mutex.RLock()
+	defer a.mutex.RUnlock()
+	return uint64(a.store.totalPoolSize(a.family))
 }
 
 // RestoreFinished marks the status of restoration as done

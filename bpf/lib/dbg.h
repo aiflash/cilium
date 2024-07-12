@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_DBG__
-#define __LIB_DBG__
+#pragma once
 
 /* Trace types */
 enum {
@@ -60,11 +59,11 @@ enum {
 				 */
 	DBG_CT_LOOKUP4_2,       /* arg1: (nexthdr << 8) | flags
 				 * arg2: direction
-				 * arg3: unused
+				 * arg3: scope
 				 */
 	DBG_CT_CREATED4,        /* arg1: (unused << 16) | rev_nat_index
 				 * arg2: src sec-id
-				 * arg3: lb address
+				 * arg3: unused
 				 */
 	DBG_CT_LOOKUP6_1,       /* arg1: saddr (last 4 bytes)
 				 * arg2: daddr (last 4 bytes)
@@ -72,7 +71,7 @@ enum {
 				 */
 	DBG_CT_LOOKUP6_2,       /* arg1: (nexthdr << 8) | flags
 				 * arg2: direction
-				 * arg3: unused
+				 * arg3: scope
 				 */
 	DBG_CT_CREATED6,        /* arg1: (unused << 16) | rev_nat_index
 				 * arg2: src sec-id
@@ -123,6 +122,7 @@ enum {
 				 * arg2: daddr (last 4 bytes for IPv6)
 				 * arg3: proxy port (in host byte order)
 				 */
+	DBG_SKIP_POLICY,	/**/
 };
 
 /* Capture types */
@@ -266,4 +266,3 @@ void cilium_dbg_capture2(struct __ctx_buff *ctx __maybe_unused,
 }
 
 #endif
-#endif /* __LIB_DBG__ */

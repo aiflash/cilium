@@ -38,6 +38,12 @@ func (o *PostIpamIPReader) ReadResponse(response runtime.ClientResponse, consume
 			return nil, err
 		}
 		return nil, result
+	case 403:
+		result := NewPostIpamIPForbidden()
+		if err := result.readResponse(response, consumer, o.formats); err != nil {
+			return nil, err
+		}
+		return nil, result
 	case 409:
 		result := NewPostIpamIPExists()
 		if err := result.readResponse(response, consumer, o.formats); err != nil {
@@ -57,7 +63,7 @@ func (o *PostIpamIPReader) ReadResponse(response runtime.ClientResponse, consume
 		}
 		return nil, result
 	default:
-		return nil, runtime.NewAPIError("response status code does not match any response statuses defined for this endpoint in the swagger spec", response, response.Code())
+		return nil, runtime.NewAPIError("[POST /ipam/{ip}] PostIpamIP", response, response.Code())
 	}
 }
 
@@ -97,6 +103,11 @@ func (o *PostIpamIPOK) IsServerError() bool {
 // IsCode returns true when this post ipam Ip o k response a status code equal to that given
 func (o *PostIpamIPOK) IsCode(code int) bool {
 	return code == 200
+}
+
+// Code gets the status code for the post ipam Ip o k response
+func (o *PostIpamIPOK) Code() int {
+	return 200
 }
 
 func (o *PostIpamIPOK) Error() string {
@@ -150,6 +161,11 @@ func (o *PostIpamIPInvalid) IsCode(code int) bool {
 	return code == 400
 }
 
+// Code gets the status code for the post ipam Ip invalid response
+func (o *PostIpamIPInvalid) Code() int {
+	return 400
+}
+
 func (o *PostIpamIPInvalid) Error() string {
 	return fmt.Sprintf("[POST /ipam/{ip}][%d] postIpamIpInvalid ", 400)
 }
@@ -159,6 +175,62 @@ func (o *PostIpamIPInvalid) String() string {
 }
 
 func (o *PostIpamIPInvalid) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
+
+	return nil
+}
+
+// NewPostIpamIPForbidden creates a PostIpamIPForbidden with default headers values
+func NewPostIpamIPForbidden() *PostIpamIPForbidden {
+	return &PostIpamIPForbidden{}
+}
+
+/*
+PostIpamIPForbidden describes a response with status code 403, with default header values.
+
+Forbidden
+*/
+type PostIpamIPForbidden struct {
+}
+
+// IsSuccess returns true when this post ipam Ip forbidden response has a 2xx status code
+func (o *PostIpamIPForbidden) IsSuccess() bool {
+	return false
+}
+
+// IsRedirect returns true when this post ipam Ip forbidden response has a 3xx status code
+func (o *PostIpamIPForbidden) IsRedirect() bool {
+	return false
+}
+
+// IsClientError returns true when this post ipam Ip forbidden response has a 4xx status code
+func (o *PostIpamIPForbidden) IsClientError() bool {
+	return true
+}
+
+// IsServerError returns true when this post ipam Ip forbidden response has a 5xx status code
+func (o *PostIpamIPForbidden) IsServerError() bool {
+	return false
+}
+
+// IsCode returns true when this post ipam Ip forbidden response a status code equal to that given
+func (o *PostIpamIPForbidden) IsCode(code int) bool {
+	return code == 403
+}
+
+// Code gets the status code for the post ipam Ip forbidden response
+func (o *PostIpamIPForbidden) Code() int {
+	return 403
+}
+
+func (o *PostIpamIPForbidden) Error() string {
+	return fmt.Sprintf("[POST /ipam/{ip}][%d] postIpamIpForbidden ", 403)
+}
+
+func (o *PostIpamIPForbidden) String() string {
+	return fmt.Sprintf("[POST /ipam/{ip}][%d] postIpamIpForbidden ", 403)
+}
+
+func (o *PostIpamIPForbidden) readResponse(response runtime.ClientResponse, consumer runtime.Consumer, formats strfmt.Registry) error {
 
 	return nil
 }
@@ -199,6 +271,11 @@ func (o *PostIpamIPExists) IsServerError() bool {
 // IsCode returns true when this post ipam Ip exists response a status code equal to that given
 func (o *PostIpamIPExists) IsCode(code int) bool {
 	return code == 409
+}
+
+// Code gets the status code for the post ipam Ip exists response
+func (o *PostIpamIPExists) Code() int {
+	return 409
 }
 
 func (o *PostIpamIPExists) Error() string {
@@ -251,6 +328,11 @@ func (o *PostIpamIPFailure) IsServerError() bool {
 // IsCode returns true when this post ipam Ip failure response a status code equal to that given
 func (o *PostIpamIPFailure) IsCode(code int) bool {
 	return code == 500
+}
+
+// Code gets the status code for the post ipam Ip failure response
+func (o *PostIpamIPFailure) Code() int {
+	return 500
 }
 
 func (o *PostIpamIPFailure) Error() string {
@@ -311,6 +393,11 @@ func (o *PostIpamIPDisabled) IsServerError() bool {
 // IsCode returns true when this post ipam Ip disabled response a status code equal to that given
 func (o *PostIpamIPDisabled) IsCode(code int) bool {
 	return code == 501
+}
+
+// Code gets the status code for the post ipam Ip disabled response
+func (o *PostIpamIPDisabled) Code() int {
+	return 501
 }
 
 func (o *PostIpamIPDisabled) Error() string {

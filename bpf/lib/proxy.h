@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_PROXY_H_
-#define __LIB_PROXY_H_
+#pragma once
 
 #include "conntrack.h"
 
@@ -28,7 +27,7 @@ assign_socket_tcp(struct __ctx_buff *ctx,
 	if (established && sk->state == BPF_TCP_LISTEN)
 		goto release;
 
-	dbg_ctx = sk->family << 16 | ctx->protocol;
+	dbg_ctx = READ_ONCE(sk)->family << 16 | ctx->protocol;
 	result = sk_assign(ctx, sk, 0);
 	cilium_dbg(ctx, DBG_SK_ASSIGN, -result, dbg_ctx);
 	if (result == 0)
@@ -54,7 +53,7 @@ assign_socket_udp(struct __ctx_buff *ctx,
 	if (!sk)
 		goto out;
 
-	dbg_ctx = sk->family << 16 | ctx->protocol;
+	dbg_ctx = READ_ONCE(sk)->family << 16 | ctx->protocol;
 	result = sk_assign(ctx, sk, 0);
 	cilium_dbg(ctx, DBG_SK_ASSIGN, -result, dbg_ctx);
 	if (result == 0)
@@ -211,7 +210,7 @@ __ctx_redirect_to_proxy(struct __ctx_buff *ctx, void *tuple __maybe_unused,
 #endif
 		ctx->mark = MARK_MAGIC_TO_PROXY | proxy_port << 16;
 
-	cilium_dbg(ctx, DBG_CAPTURE_PROXY_PRE, proxy_port, 0);
+	cilium_dbg_capture(ctx, DBG_CAPTURE_PROXY_PRE, proxy_port);
 
 #ifdef ENABLE_TPROXY
 	if (proxy_port && !from_host) {
@@ -268,14 +267,11 @@ ctx_redirect_to_proxy6(struct __ctx_buff *ctx, void *tuple __maybe_unused,
 static __always_inline int						\
 NAME(struct __ctx_buff *ctx, struct PREFIX ## _ct_tuple *tuple)		\
 {									\
-	int err, l4_off;						\
+	int err;							\
 									\
-	err = PREFIX ## _extract_tuple(ctx, tuple, &l4_off);		\
+	err = PREFIX ## _extract_tuple(ctx, tuple);			\
 	if (err != CTX_ACT_OK)						\
 		return err;						\
-									\
-	if (ctx_load_bytes(ctx, l4_off, &tuple->dport, 4) < 0)		\
-		return DROP_CT_INVALID_HDR;				\
 									\
 	__ ## PREFIX ## _ct_tuple_reverse(tuple);			\
 									\
@@ -353,7 +349,7 @@ ctx_redirect_to_proxy_first(struct __ctx_buff *ctx, __be16 proxy_port)
 #endif /* ENABLE_TPROXY */
 
 mark: __maybe_unused;
-	cilium_dbg(ctx, DBG_CAPTURE_PROXY_POST, proxy_port, 0);
+	cilium_dbg_capture(ctx, DBG_CAPTURE_PROXY_POST, proxy_port);
 	ctx->mark = MARK_MAGIC_TO_PROXY | (proxy_port << 16);
 	ctx_change_type(ctx, PACKET_HOST);
 
@@ -362,30 +358,29 @@ out: __maybe_unused;
 }
 
 /**
- * tc_index_skip_ingress_proxy - returns true if packet originates from ingress proxy
+ * tc_index_from_ingress_proxy - returns true if packet originates from ingress proxy
  */
-static __always_inline bool tc_index_skip_ingress_proxy(struct __ctx_buff *ctx)
+static __always_inline bool tc_index_from_ingress_proxy(struct __ctx_buff *ctx)
 {
 	volatile __u32 tc_index = ctx->tc_index;
 #ifdef DEBUG
-	if (tc_index & TC_INDEX_F_SKIP_INGRESS_PROXY)
+	if (tc_index & TC_INDEX_F_FROM_INGRESS_PROXY)
 		cilium_dbg(ctx, DBG_SKIP_PROXY, tc_index, 0);
 #endif
 
-	return tc_index & TC_INDEX_F_SKIP_INGRESS_PROXY;
+	return tc_index & TC_INDEX_F_FROM_INGRESS_PROXY;
 }
 
 /**
- * tc_index_skip_egress_proxy - returns true if packet originates from egress proxy
+ * tc_index_from_egress_proxy - returns true if packet originates from egress proxy
  */
-static __always_inline bool tc_index_skip_egress_proxy(struct __ctx_buff *ctx)
+static __always_inline bool tc_index_from_egress_proxy(struct __ctx_buff *ctx)
 {
 	volatile __u32 tc_index = ctx->tc_index;
 #ifdef DEBUG
-	if (tc_index & TC_INDEX_F_SKIP_EGRESS_PROXY)
+	if (tc_index & TC_INDEX_F_FROM_EGRESS_PROXY)
 		cilium_dbg(ctx, DBG_SKIP_PROXY, tc_index, 0);
 #endif
 
-	return tc_index & TC_INDEX_F_SKIP_EGRESS_PROXY;
+	return tc_index & TC_INDEX_F_FROM_EGRESS_PROXY;
 }
-#endif /* __LIB_PROXY_H_ */

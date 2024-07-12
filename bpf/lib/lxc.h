@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __LIB_LXC_H_
-#define __LIB_LXC_H_
+#pragma once
 
 #include "common.h"
 #include "utils.h"
@@ -27,7 +26,7 @@ int is_valid_lxc_src_ip(struct ipv6hdr *ip6 __maybe_unused)
 
 	BPF_V6(valid, LXC_IP);
 
-	return !ipv6_addrcmp((union v6addr *) &ip6->saddr, &valid);
+	return ipv6_addr_equals((union v6addr *)&ip6->saddr, &valid);
 #else
 	return 0;
 #endif
@@ -56,5 +55,3 @@ int is_valid_lxc_src_ipv4(struct iphdr *ip4 __maybe_unused)
 	return 1;
 }
 #endif /* ENABLE_SIP_VERIFICATION */
-
-#endif /* __LIB_LXC_H_ */

@@ -33,21 +33,22 @@ func FuzzResolveEgressPolicy(f *testing.F) {
 		}
 		rule := &rule{Rule: r}
 		state := traceState{}
-		_, _ = rule.resolveEgressPolicy(testPolicyContext, fromBar, &state, L4PolicyMap{}, nil, nil)
+		td := newTestData()
+		_, _ = rule.resolveEgressPolicy(td.testPolicyContext, fromBar, &state, NewL4PolicyMap(), nil, nil)
 
 	})
 }
 
 func FuzzDenyPreferredInsert(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
-		keys := MapState{}
+		keys := newMapState(nil)
 		key := Key{}
 		entry := MapStateEntry{}
 		ff := fuzz.NewConsumer(data)
-		ff.GenerateStruct(&keys)
+		ff.GenerateStruct(keys)
 		ff.GenerateStruct(&key)
 		ff.GenerateStruct(&entry)
-		keys.DenyPreferredInsert(key, entry, nil)
+		keys.denyPreferredInsert(key, entry, nil, allFeatures)
 	})
 }
 
@@ -76,7 +77,13 @@ func FuzzAccumulateMapChange(f *testing.F) {
 		if err != nil {
 			t.Skip()
 		}
+		var proxyPort uint16
+		if redirect {
+			proxyPort = 1
+		}
+		key := Key{DestPort: port, Nexthdr: proto, TrafficDirection: dir.Uint8()}
+		value := NewMapStateEntry(csFoo, nil, proxyPort, "", 0, deny, DefaultAuthType, AuthTypeDisabled)
 		policyMaps := MapChanges{}
-		policyMaps.AccumulateMapChanges(csFoo, adds, deletes, port, proto, dir, redirect, deny, AuthTypeNone, nil)
+		policyMaps.AccumulateMapChanges(csFoo, adds, deletes, []Key{key}, value)
 	})
 }

@@ -6,11 +6,15 @@ package allocator
 import (
 	"context"
 	"sync"
-	"time"
 
+	"github.com/cilium/stream"
+	"github.com/sirupsen/logrus"
+
+	"github.com/cilium/cilium/pkg/controller"
 	"github.com/cilium/cilium/pkg/idpool"
-	"github.com/cilium/cilium/pkg/kvstore"
 	"github.com/cilium/cilium/pkg/lock"
+	"github.com/cilium/cilium/pkg/logging/logfields"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 // backendOpTimeout is the time allowed for operations sent to backends in
@@ -24,6 +28,8 @@ type idMap map[idpool.ID]AllocatorKey
 type keyMap map[string]idpool.ID
 
 type cache struct {
+	controllers *controller.Manager
+
 	allocator *Allocator
 
 	stopChan chan struct{}
@@ -56,15 +62,22 @@ type cache struct {
 	// watcher is started with the conditions marked as done when the
 	// watcher has exited
 	stopWatchWg sync.WaitGroup
+
+	changeSrc         stream.Observable[AllocatorChange]
+	emitChange        func(AllocatorChange)
+	completeChangeSrc func(error)
 }
 
-func newCache(a *Allocator) cache {
-	return cache{
-		allocator: a,
-		cache:     idMap{},
-		keyCache:  keyMap{},
-		stopChan:  make(chan struct{}),
+func newCache(a *Allocator) (c cache) {
+	c = cache{
+		allocator:   a,
+		cache:       idMap{},
+		keyCache:    keyMap{},
+		stopChan:    make(chan struct{}),
+		controllers: controller.NewManager(),
 	}
+	c.changeSrc, c.emitChange, c.completeChangeSrc = stream.Multicast[AllocatorChange]()
+	return
 }
 
 type waitChan chan struct{}
@@ -75,12 +88,10 @@ type CacheMutations interface {
 	// OnListDone is called when the initial full-sync is complete.
 	OnListDone()
 
-	// OnAdd is called when a new key->ID appears.
-	OnAdd(id idpool.ID, key AllocatorKey)
-
-	// OnModify is called when a key->ID mapping is modified. This may happen
-	// when leases are updated, and does not mean the actual mapping had changed.
-	OnModify(id idpool.ID, key AllocatorKey)
+	// OnUpsert is called when either a new key->ID mapping appears or an existing
+	// one is modified. The latter case may occur e.g., when leases are updated,
+	// and does not mean that the actual mapping had changed.
+	OnUpsert(id idpool.ID, key AllocatorKey)
 
 	// OnDelete is called when a key->ID mapping is removed. This may trigger
 	// master-key protection, if enabled, where the local allocator will recreate
@@ -89,7 +100,7 @@ type CacheMutations interface {
 	OnDelete(id idpool.ID, key AllocatorKey)
 }
 
-func (c *cache) sendEvent(typ kvstore.EventType, id idpool.ID, key AllocatorKey) {
+func (c *cache) sendEvent(typ AllocatorChangeKind, id idpool.ID, key AllocatorKey) {
 	if events := c.allocator.events; events != nil {
 		events <- AllocatorEvent{Typ: typ, ID: id, Key: key}
 	}
@@ -110,20 +121,17 @@ func (c *cache) OnListDone() {
 	close(c.listDone)
 }
 
-func (c *cache) OnAdd(id idpool.ID, key AllocatorKey) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
-	c.nextCache[id] = key
-	if key != nil {
-		c.nextKeyCache[c.allocator.encodeKey(key)] = id
+func (c *cache) OnUpsert(id idpool.ID, key AllocatorKey) {
+	for _, validator := range c.allocator.cacheValidators {
+		if err := validator(AllocatorChangeUpsert, id, key); err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.Identity: id,
+				logfields.Event:    AllocatorChangeUpsert,
+			}).Warning("Skipping event for invalid identity")
+			return
+		}
 	}
-	c.allocator.idPool.Remove(id)
 
-	c.sendEvent(kvstore.EventTypeCreate, id, key)
-}
-
-func (c *cache) OnModify(id idpool.ID, key AllocatorKey) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -136,22 +144,76 @@ func (c *cache) OnModify(id idpool.ID, key AllocatorKey) {
 		c.nextKeyCache[c.allocator.encodeKey(key)] = id
 	}
 
-	c.sendEvent(kvstore.EventTypeModify, id, key)
+	c.allocator.idPool.Remove(id)
+
+	c.emitChange(AllocatorChange{Kind: AllocatorChangeUpsert, ID: id, Key: key})
+
+	c.sendEvent(AllocatorChangeUpsert, id, key)
 }
 
 func (c *cache) OnDelete(id idpool.ID, key AllocatorKey) {
+	for _, validator := range c.allocator.cacheValidators {
+		if err := validator(AllocatorChangeDelete, id, key); err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.Identity: id,
+				logfields.Event:    AllocatorChangeDelete,
+			}).Warning("Skipping event for invalid identity")
+			return
+		}
+	}
+
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	c.onDeleteLocked(id, key, true)
+}
+
+const syncIdentityControllerGroup = "sync-identity"
+
+func syncControllerName(id idpool.ID) string {
+	return syncIdentityControllerGroup + "-" + id.String()
+}
+
+// no max interval by default, exposed as a variable for testing.
+var masterKeyRecreateMaxInterval = time.Duration(0)
+
+var syncIdentityGroup = controller.NewGroup(syncIdentityControllerGroup)
+
+// onDeleteLocked must be called while holding c.Mutex for writing
+func (c *cache) onDeleteLocked(id idpool.ID, key AllocatorKey, recreateMissingLocalKeys bool) {
 	a := c.allocator
-	if a.enableMasterKeyProtection {
+	if a.enableMasterKeyProtection && recreateMissingLocalKeys {
 		if value := a.localKeys.lookupID(id); value != nil {
-			ctx, cancel := context.WithTimeout(context.TODO(), backendOpTimeout)
-			defer cancel()
-			err := a.backend.UpdateKey(ctx, id, value, true)
-			if err != nil {
-				log.WithError(err).Errorf("OnDelete MasterKeyProtection update for key %q", id)
-			}
+			c.controllers.UpdateController(syncControllerName(id), controller.ControllerParams{
+				Context:          context.Background(),
+				MaxRetryInterval: masterKeyRecreateMaxInterval,
+				Group:            syncIdentityGroup,
+				DoFunc: func(ctx context.Context) error {
+					c.mutex.Lock()
+					defer c.mutex.Unlock()
+					// For each attempt, check if this ciliumidentity is still a candidate for recreation.
+					// It's possible that since the last iteration that this agent has legitimately deleted
+					// the key, in which case we can stop trying to recreate it.
+					if value := c.allocator.localKeys.lookupID(id); value == nil {
+						return nil
+					}
+
+					ctx, cancel := context.WithTimeout(ctx, backendOpTimeout)
+					defer cancel()
+
+					// Each iteration will attempt to grab the key reference, if that succeeds
+					// then this completes (i.e. the key exists).
+					// Otherwise we will attempt to create the key, this process repeats until
+					// the key is created.
+					if err := a.backend.UpdateKey(ctx, id, value, true); err != nil {
+						log.WithField("id", id).WithError(err).Error("OnDelete MasterKeyProtection update for key")
+						return err
+					}
+					log.WithField("id", id).Info("OnDelete MasterKeyProtection update succeeded")
+					return nil
+				},
+			})
+
 			return
 		}
 	}
@@ -163,7 +225,9 @@ func (c *cache) OnDelete(id idpool.ID, key AllocatorKey) {
 	delete(c.nextCache, id)
 	a.idPool.Insert(id)
 
-	c.sendEvent(kvstore.EventTypeDelete, id, key)
+	c.emitChange(AllocatorChange{Kind: AllocatorChangeDelete, ID: id, Key: key})
+
+	c.sendEvent(AllocatorChangeDelete, id, key)
 }
 
 // start requests a LIST operation from the kvstore and starts watching the
@@ -191,6 +255,43 @@ func (c *cache) start() waitChan {
 func (c *cache) stop() {
 	close(c.stopChan)
 	c.stopWatchWg.Wait()
+	// Drain/stop any remaining sync identity controllers.
+	// Backend watch is now stopped, any running controllers attempting to
+	// sync identities will complete and stop (possibly in a unresolved state).
+	c.controllers.RemoveAllAndWait()
+	c.completeChangeSrc(nil)
+}
+
+// drain emits a deletion event for all known IDs. It must be called after the
+// cache has been stopped, to ensure that no new events can be received afterwards.
+func (c *cache) drain() {
+	// Make sure we wait until the watch loop has been properly stopped.
+	c.stopWatchWg.Wait()
+
+	c.mutex.Lock()
+	for id, key := range c.nextCache {
+		c.onDeleteLocked(id, key, false)
+	}
+	c.mutex.Unlock()
+}
+
+// drainIf emits a deletion event for all known IDs that are stale according to
+// the isStale function. It must be called after the cache has been stopped, to
+// ensure that no new events can be received afterwards.
+func (c *cache) drainIf(isStale func(id idpool.ID) bool) {
+	// Make sure we wait until the watch loop has been properly stopped, otherwise
+	// new IDs might be added afterwards we complete the draining process.
+	c.stopWatchWg.Wait()
+
+	c.mutex.Lock()
+	for id, key := range c.nextCache {
+		if isStale(id) {
+			c.onDeleteLocked(id, key, false)
+			log.WithFields(logrus.Fields{fieldID: id, fieldKey: key}).
+				Debug("Stale identity deleted")
+		}
+	}
+	c.mutex.Unlock()
 }
 
 func (c *cache) get(key string) idpool.ID {
@@ -234,4 +335,52 @@ func (c *cache) numEntries() int {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 	return len(c.nextCache)
+}
+
+type AllocatorChangeKind string
+
+const (
+	AllocatorChangeSync   AllocatorChangeKind = "sync"
+	AllocatorChangeUpsert AllocatorChangeKind = "upsert"
+	AllocatorChangeDelete AllocatorChangeKind = "delete"
+)
+
+type AllocatorChange struct {
+	Kind AllocatorChangeKind
+	ID   idpool.ID
+	Key  AllocatorKey
+}
+
+// Observe the allocator changes. Conforms to stream.Observable.
+// Replays the current state of the cache when subscribing.
+func (c *cache) Observe(ctx context.Context, next func(AllocatorChange), complete func(error)) {
+	// This short-lived go routine serves the purpose of replaying the current state of the cache before starting
+	// to observe the actual source changeSrc. ChangeSrc is backed by a stream.FuncObservable, that will start its own
+	// go routine. Therefore, the current go routine will stop and free the lock on the mutex after the registration.
+	go func() {
+		// Wait until initial listing has completed before
+		// replaying the state.
+		select {
+		case <-c.listDone:
+		case <-ctx.Done():
+			complete(ctx.Err())
+			return
+		}
+
+		c.mutex.RLock()
+		defer c.mutex.RUnlock()
+
+		for id, key := range c.cache {
+			next(AllocatorChange{Kind: AllocatorChangeUpsert, ID: id, Key: key})
+		}
+
+		// Emit a sync event to inform the subscriber that it has received a consistent
+		// initial state.
+		next(AllocatorChange{Kind: AllocatorChangeSync})
+
+		// And subscribe to new events. Since we held the read-lock there won't be any
+		// missed or duplicate events.
+		c.changeSrc.Observe(ctx, next, complete)
+	}()
+
 }

@@ -4,8 +4,8 @@ package ec2
 
 import (
 	"context"
+	"fmt"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -13,14 +13,17 @@ import (
 
 // Creates crash-consistent snapshots of multiple EBS volumes and stores the data
 // in S3. Volumes are chosen by specifying an instance. Any attached volumes will
-// produce one snapshot each that is crash-consistent across the instance. You can
-// include all of the volumes currently attached to the instance, or you can
-// exclude the root volume or specific data (non-root) volumes from the
-// multi-volume snapshot set. You can create multi-volume snapshots of instances in
-// a Region and instances on an Outpost. If you create snapshots from an instance
-// in a Region, the snapshots must be stored in the same Region as the instance. If
-// you create snapshots from an instance on an Outpost, the snapshots can be stored
-// on the same Outpost as the instance, or in the Region for that Outpost.
+// produce one snapshot each that is crash-consistent across the instance.
+//
+// You can include all of the volumes currently attached to the instance, or you
+// can exclude the root volume or specific data (non-root) volumes from the
+// multi-volume snapshot set.
+//
+// You can create multi-volume snapshots of instances in a Region and instances on
+// an Outpost. If you create snapshots from an instance in a Region, the snapshots
+// must be stored in the same Region as the instance. If you create snapshots from
+// an instance on an Outpost, the snapshots can be stored on the same Outpost as
+// the instance, or in the Region for that Outpost.
 func (c *Client) CreateSnapshots(ctx context.Context, params *CreateSnapshotsInput, optFns ...func(*Options)) (*CreateSnapshotsOutput, error) {
 	if params == nil {
 		params = &CreateSnapshotsInput{}
@@ -46,35 +49,32 @@ type CreateSnapshotsInput struct {
 	// Copies the tags from the specified volume to corresponding snapshot.
 	CopyTagsFromSource types.CopyTagsFromSource
 
-	// A description propagated to every snapshot specified by the instance.
+	//  A description propagated to every snapshot specified by the instance.
 	Description *string
 
 	// Checks whether you have the required permissions for the action, without
 	// actually making the request, and provides an error response. If you have the
-	// required permissions, the error response is DryRunOperation. Otherwise, it is
-	// UnauthorizedOperation.
+	// required permissions, the error response is DryRunOperation . Otherwise, it is
+	// UnauthorizedOperation .
 	DryRun *bool
 
 	// The Amazon Resource Name (ARN) of the Outpost on which to create the local
 	// snapshots.
 	//
-	// * To create snapshots from an instance in a Region, omit this
-	// parameter. The snapshots are created in the same Region as the instance.
+	//   - To create snapshots from an instance in a Region, omit this parameter. The
+	//   snapshots are created in the same Region as the instance.
 	//
-	// * To
-	// create snapshots from an instance on an Outpost and store the snapshots in the
-	// Region, omit this parameter. The snapshots are created in the Region for the
-	// Outpost.
+	//   - To create snapshots from an instance on an Outpost and store the snapshots
+	//   in the Region, omit this parameter. The snapshots are created in the Region for
+	//   the Outpost.
 	//
-	// * To create snapshots from an instance on an Outpost and store the
-	// snapshots on an Outpost, specify the ARN of the destination Outpost. The
-	// snapshots must be created on the same Outpost as the instance.
+	//   - To create snapshots from an instance on an Outpost and store the snapshots
+	//   on an Outpost, specify the ARN of the destination Outpost. The snapshots must be
+	//   created on the same Outpost as the instance.
 	//
-	// For more
-	// information, see  Create multi-volume local snapshots from instances on an
-	// Outpost
-	// (https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/snapshots-outposts.html#create-multivol-snapshot)
-	// in the Amazon Elastic Compute Cloud User Guide.
+	// For more information, see [Create multi-volume local snapshots from instances on an Outpost] in the Amazon EBS User Guide.
+	//
+	// [Create multi-volume local snapshots from instances on an Outpost]: https://docs.aws.amazon.com/ebs/latest/userguide/snapshots-outposts.html#create-multivol-snapshot
 	OutpostArn *string
 
 	// Tags to apply to every snapshot specified by the instance.
@@ -95,6 +95,9 @@ type CreateSnapshotsOutput struct {
 }
 
 func (c *Client) addOperationCreateSnapshotsMiddlewares(stack *middleware.Stack, options Options) (err error) {
+	if err := stack.Serialize.Add(&setOperationInputMiddleware{}, middleware.After); err != nil {
+		return err
+	}
 	err = stack.Serialize.Add(&awsEc2query_serializeOpCreateSnapshots{}, middleware.After)
 	if err != nil {
 		return err
@@ -103,34 +106,38 @@ func (c *Client) addOperationCreateSnapshotsMiddlewares(stack *middleware.Stack,
 	if err != nil {
 		return err
 	}
+	if err := addProtocolFinalizerMiddlewares(stack, options, "CreateSnapshots"); err != nil {
+		return fmt.Errorf("add protocol finalizers: %v", err)
+	}
+
+	if err = addlegacyEndpointContextSetter(stack, options); err != nil {
+		return err
+	}
 	if err = addSetLoggerMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddClientRequestIDMiddleware(stack); err != nil {
+	if err = addClientRequestID(stack); err != nil {
 		return err
 	}
-	if err = smithyhttp.AddComputeContentLengthMiddleware(stack); err != nil {
+	if err = addComputeContentLength(stack); err != nil {
 		return err
 	}
 	if err = addResolveEndpointMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = v4.AddComputePayloadSHA256Middleware(stack); err != nil {
+	if err = addComputePayloadSHA256(stack); err != nil {
 		return err
 	}
-	if err = addRetryMiddlewares(stack, options); err != nil {
+	if err = addRetry(stack, options); err != nil {
 		return err
 	}
-	if err = addHTTPSignerV4Middleware(stack, options); err != nil {
+	if err = addRawResponseToMetadata(stack); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRawResponseToMetadata(stack); err != nil {
+	if err = addRecordResponseTiming(stack); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRecordResponseTiming(stack); err != nil {
-		return err
-	}
-	if err = addClientUserAgent(stack); err != nil {
+	if err = addClientUserAgent(stack, options); err != nil {
 		return err
 	}
 	if err = smithyhttp.AddErrorCloseResponseBodyMiddleware(stack); err != nil {
@@ -139,10 +146,22 @@ func (c *Client) addOperationCreateSnapshotsMiddlewares(stack *middleware.Stack,
 	if err = smithyhttp.AddCloseResponseBodyMiddleware(stack); err != nil {
 		return err
 	}
+	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
+		return err
+	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
+		return err
+	}
 	if err = addOpCreateSnapshotsValidationMiddleware(stack); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opCreateSnapshots(options.Region), middleware.Before); err != nil {
+		return err
+	}
+	if err = addRecursionDetection(stack); err != nil {
 		return err
 	}
 	if err = addRequestIDRetrieverMiddleware(stack); err != nil {
@@ -154,6 +173,9 @@ func (c *Client) addOperationCreateSnapshotsMiddlewares(stack *middleware.Stack,
 	if err = addRequestResponseLogging(stack, options); err != nil {
 		return err
 	}
+	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -161,7 +183,6 @@ func newServiceMetadataMiddleware_opCreateSnapshots(region string) *awsmiddlewar
 	return &awsmiddleware.RegisterServiceMetadata{
 		Region:        region,
 		ServiceID:     ServiceID,
-		SigningName:   "ec2",
 		OperationName: "CreateSnapshots",
 	}
 }

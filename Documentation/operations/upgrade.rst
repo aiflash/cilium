@@ -13,7 +13,7 @@ Upgrade Guide
 .. _upgrade_general:
 
 This upgrade guide is intended for Cilium running on Kubernetes. If you have
-questions, feel free to ping us on the :term:`Slack channel`.
+questions, feel free to ping us on `Cilium Slack`_.
 
 .. include:: upgrade-warning.rst
 
@@ -140,9 +140,8 @@ Step 1: Upgrade to latest patch version
 ---------------------------------------
 
 When upgrading from one minor release to another minor release, for example
-1.x to 1.y, it is recommended to upgrade to the latest patch release for a
-Cilium release series first. The latest patch releases for each supported
-version of Cilium are `here <https://github.com/cilium/cilium#stable-releases>`_.
+1.x to 1.y, it is recommended to upgrade to the `latest patch release
+<https://github.com/cilium/cilium#stable-releases>`__ for a Cilium release series first.
 Upgrading to the latest patch release ensures the most seamless experience if a
 rollback is required following the minor release upgrade. The upgrade guides
 for previous versions can be found for each minor version at the bottom left
@@ -205,7 +204,7 @@ version which was installed in this cluster.
         mode: "kubernetes"
       k8sServiceHost: "API_SERVER_IP"
       k8sServicePort: "API_SERVER_PORT"
-      kubeProxyReplacement: "strict"
+      kubeProxyReplacement: "true"
 
    You can then upgrade using this values file by running:
 
@@ -281,16 +280,16 @@ The table below lists suggested upgrade transitions, from a specified current
 version running in a cluster to a specified target version. If a specific
 combination is not listed in the table below, then it may not be safe. In that
 case, consider performing incremental upgrades between versions (e.g. upgrade
-from ``1.11.x`` to ``1.12.y`` first, and to ``1.13.z`` only afterwards).
+from ``1.12.x`` to ``1.13.y`` first, and to ``1.14.z`` only afterwards).
 
 +-----------------------+-----------------------+-------------------------+---------------------------+
 | Current version       | Target version        | L3/L4 impact            | L7 impact                 |
 +=======================+=======================+=========================+===========================+
+| ``1.13.x``            | ``1.14.y``            | Minimal to None         | Clients must reconnect[1] |
++-----------------------+-----------------------+-------------------------+---------------------------+
 | ``1.12.x``            | ``1.13.y``            | Minimal to None         | Clients must reconnect[1] |
 +-----------------------+-----------------------+-------------------------+---------------------------+
 | ``1.11.x``            | ``1.12.y``            | Minimal to None         | Clients must reconnect[1] |
-+-----------------------+-----------------------+-------------------------+---------------------------+
-| ``1.10.x``            | ``1.11.y``            | Minimal to None         | Clients must reconnect[1] |
 +-----------------------+-----------------------+-------------------------+---------------------------+
 
 Annotations:
@@ -302,114 +301,35 @@ Annotations:
 
 .. _current_release_required_changes:
 
-.. _1.14_upgrade_notes:
+.. _1.17_upgrade_notes:
 
-1.14 Upgrade Notes
+1.17 Upgrade Notes
 ------------------
-* The default value of ``--tofqdns-min-ttl`` has changed from 3600 seconds to
-  zero. This means Cilium DNS network policy now honors the TTLs returned from
-  the upstream DNS server by default. Explicitly configure ``--tofqdns-min-ttl``
-  if you need to preserve the previous DNS network policy behavior that lets
-  applications create new connections after the TTL specified by the upstream
-  DNS server is expired.
-* Cilium now writes its CNI configuration file to ``05-cilium.conflist`` in
-  all cases, rather than the previous default of ``05-cilium.conf``.
-* The default value of ``--update-ec2-adapter-limit-via-api`` has changed from
-  ``false`` to ``true``. This means that the Cilium Operator will fetch the
-  most up-to-date EC2 adapter limits from the AWS API. This now requires
-  updated IAM permissions for Cilium to have ``ec2:DescribeInstances``. In EKS,
-  nodes usually have ``AmazonEKSWorkerNodePolicy`` which includes this
-  permission, so it should work in most cases. If your nodes don't have this
-  policy, then consider adding it to your IAM permissions. Explicitly configure
-  ``--update-ec2-adapter-limit-via-api`` to ``false`` if you want to avoid this
-  additional IAM permission. Beware that if your EC2 instance type that Cilium
-  is running on is not known to Cilium, it may cause a crash.
-* Egress Gateway policies now drop matching traffic when no
-  gateway nodes can be found. Previously, traffic would be allowed without
-  being rerouted towards an Egress Gateway.
 
+* Operating Cilium in ``--datapath-mode=lb-only`` for plain Docker mode now requires to
+  add an additional ``--bpf-lb-external-control-plane=true`` to the command line, otherwise
+  it is assumed that Kubernetes is present.
 
 Removed Options
 ~~~~~~~~~~~~~~~
 
-* The ``sockops-enable`` and ``force-local-policy-eval-at-source`` options deprecated in version
-  1.13 are removed.
-
-New Options
-~~~~~~~~~~~
-
-* ``routing-mode=native``: This option enables native-routing mode, in place of
-  ``tunnel=disabled``, now deprecated.
-* ``tunnel-protocol``: This option allows setting the tunneling protocol, in place
-  of e.g., ``tunnel=vxlan``.
+* The previously deprecated ``clustermesh-ip-identities-sync-timeout`` flag has
+  been removed in favor of ``clustermesh-sync-timeout``.
 
 Deprecated Options
 ~~~~~~~~~~~~~~~~~~
 
-* The ``tunnel`` option is deprecated and will be removed in v1.15. To enable
-  native-routing mode, set ``routing-mode=native`` (previously
-  ``tunnel=disabled``). To configure the tunneling protocol, set
-  ``tunnel-protocol=geneve`` (previously ``tunnel=geneve``).
+Helm Options
+~~~~~~~~~~~~
 
 Added Metrics
 ~~~~~~~~~~~~~
 
-* ``cilium_operator_ces_sync_total``
-* ``cilium_policy_change_total``
-* ``go_sched_latencies_seconds``
-* ``cilium_operator_ipam_available_ips``
-* ``cilium_operator_ipam_used_ips``
-* ``cilium_operator_ipam_needed_ips``
-
-Deprecated Metrics
-~~~~~~~~~~~~~~~~~~
-
-* ``cilium_operator_ces_sync_errors_total`` is deprecated. Please use ``cilium_operator_ces_sync_total`` instead.
-* ``cilium_policy_import_errors_total`` is deprecated. Please use
-  ``cilium_policy_change_total``, which counts all policy changes (Add, Update, Delete)
-  based on outcome ("success" or "failure").
-* ``cilium_operator_ipam_ips`` is deprecated. Use ``cilium_operator_ipam_{available,used,needed}_ips`` instead.
+Removed Metrics
+~~~~~~~~~~~~~~~
 
 Changed Metrics
 ~~~~~~~~~~~~~~~
-
-* ``cilium_bpf_map_pressure`` is now enabled by default.
-
-Helm Options
-~~~~~~~~~~~~
-
-* The ``securityContext`` for Hubble Relay now applies to the container, not
-  the pod. To update the security context of the pod, use
-  ``podSecurityContext``.
-* The ``securityContext`` for Hubble Relay now defaults to drop all
-  capabilities and run as non-root user.
-* The ``containerRuntime.integration`` value is being deprecated in favor of ``bpf.autoMount.enabled``.
-* Following the deprecation of the ``tunnel`` agent flag, ``tunnel`` is being
-  deprecated in favor of ``routingMode`` and ``tunnelProtocol`` and will be
-  removed in v1.15.
-* Values ``encryption.keyFile``, ``encryption.mountPath``,
-  ``encryption.secretName`` and ``encryption.interface`` are deprecated in
-  favor of their ``encryption.ipsec.*`` counterparts and will be removed in
-  Cilium 1.15.
-* Value ``hubble.peerService.enabled`` was deprecated in Cilium 1.13 and has
-  been removed. The peer service is no longer optional.
-* Values ``hubble.tls.ca``, ``hubble.tls.ca.cert`` and ``hubble.tls.ca.key``
-  were deprecated in Cilium 1.12 in favor of ``tls.ca``, ``tls.ca.cert`` and
-  ``tls.ca.key`` respectively, and have been removed.
-* Value ``hubble.ui.securityContext.enabled`` was deprecated in Cilium 1.12 in
-  favor of ``hubble.ui.securityContext``, and has been removed.
-* Values ``ipam.operator.clusterPoolIPv4PodCIDR`` and
-  ``ipam.operator.clusterPoolIPv6PodCIDR`` were deprecated in Cilium 1.11 in
-  favor of ``ipam.operator.clusterPoolIPv4PodCIDRList`` and
-  ``ipam.operator.clusterPoolIPv6PodCIDRList``, respectively, and have been
-  removed.
-  In order to preserve the default behavior for selecting CIDRs when default
-  values are kept, ``ipam.operator.clusterPoolIPv4PodCIDRList`` now defaults to
-  a singleton containing the default CIDR value for the removed value
-  ``ipam.operator.clusterPoolIPv4PodCIDR`` (and similarly for IPv6).
-* Values ``clustermesh.apiserver.tls.ca.cert`` and ``clustermesh.apiserver.tls.ca.key``
-  are deprecated in favor of ``tls.ca.cert`` and ``tls.ca.key`` respectively, and
-  will be removed in v1.15.
 
 .. _earlier_upgrade_notes:
 
@@ -430,16 +350,15 @@ Networking connectivity, policy enforcement and load balancing will remain
 functional in general. The following is a list of operations that will not be
 available during the upgrade:
 
-* API aware policy rules are enforced in user space proxies and are currently
-  running as part of the Cilium pod unless Cilium is configured to run in Istio
-  mode. Upgrading Cilium will cause the proxy to restart which will result in
-  a connectivity outage and connection to be reset.
+* API-aware policy rules are enforced in user space proxies and are
+  running as part of the Cilium pod. Upgrading Cilium causes the proxy to
+  restart, which results in a connectivity outage and causes the connection to reset.
 
 * Existing policy will remain effective but implementation of new policy rules
   will be postponed to after the upgrade has been completed on a particular
   node.
 
-* Monitoring components such as ``cilium monitor`` will experience a brief
+* Monitoring components such as ``cilium-dbg monitor`` will experience a brief
   outage while the Cilium pod is restarting. Events are queued up and read
   after the upgrade. If the number of events exceeds the event buffer size,
   events will be lost.
@@ -617,7 +536,7 @@ Example migration
 
 .. code-block:: shell-session
 
-      $ kubectl exec -n kube-system cilium-pre-flight-check-1234 -- cilium preflight migrate-identity
+      $ kubectl exec -n kube-system cilium-pre-flight-check-1234 -- cilium-dbg preflight migrate-identity
       INFO[0000] Setting up kvstore client
       INFO[0000] Connecting to etcd server...                  config=/var/lib/cilium/etcd-config.yml endpoints="[https://192.168.60.11:2379]" subsys=kvstore
       INFO[0000] Setting up kubernetes client
@@ -659,7 +578,7 @@ Once the migration is complete, confirm the endpoint identities match by listing
 .. code-block:: shell-session
 
       $ kubectl get ciliumendpoints -A # new CRD-backed endpoints
-      $ kubectl exec -n kube-system cilium-1234 -- cilium endpoint list # existing etcd-backed endpoints
+      $ kubectl exec -n kube-system cilium-1234 -- cilium-dbg endpoint list # existing etcd-backed endpoints
 
 Clearing CRD identities
 ~~~~~~~~~~~~~~~~~~~~~~~

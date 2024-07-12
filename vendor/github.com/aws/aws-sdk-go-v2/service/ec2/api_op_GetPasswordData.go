@@ -6,31 +6,35 @@ import (
 	"context"
 	"fmt"
 	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/smithy-go/middleware"
 	smithytime "github.com/aws/smithy-go/time"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	smithywaiter "github.com/aws/smithy-go/waiter"
-	"github.com/jmespath/go-jmespath"
+	jmespath "github.com/jmespath/go-jmespath"
 	"strconv"
 	"time"
 )
 
 // Retrieves the encrypted administrator password for a running Windows instance.
+//
 // The Windows password is generated at boot by the EC2Config service or EC2Launch
 // scripts (Windows Server 2016 and later). This usually only happens the first
-// time an instance is launched. For more information, see EC2Config
-// (https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/UsingConfig_WinAMI.html)
-// and EC2Launch
-// (https://docs.aws.amazon.com/AWSEC2/latest/WindowsGuide/ec2launch.html) in the
-// Amazon EC2 User Guide. For the EC2Config service, the password is not generated
-// for rebundled AMIs unless Ec2SetPassword is enabled before bundling. The
-// password is encrypted using the key pair that you specified when you launched
-// the instance. You must provide the corresponding key pair file. When you launch
-// an instance, password generation and encryption may take a few minutes. If you
-// try to retrieve the password before it's available, the output returns an empty
-// string. We recommend that you wait up to 15 minutes after launching an instance
-// before trying to retrieve the generated password.
+// time an instance is launched. For more information, see [EC2Config]and [EC2Launch] in the Amazon EC2
+// User Guide.
+//
+// For the EC2Config service, the password is not generated for rebundled AMIs
+// unless Ec2SetPassword is enabled before bundling.
+//
+// The password is encrypted using the key pair that you specified when you
+// launched the instance. You must provide the corresponding key pair file.
+//
+// When you launch an instance, password generation and encryption may take a few
+// minutes. If you try to retrieve the password before it's available, the output
+// returns an empty string. We recommend that you wait up to 15 minutes after
+// launching an instance before trying to retrieve the generated password.
+//
+// [EC2Launch]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2launch.html
+// [EC2Config]: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/UsingConfig_WinAMI.html
 func (c *Client) GetPasswordData(ctx context.Context, params *GetPasswordDataInput, optFns ...func(*Options)) (*GetPasswordDataOutput, error) {
 	if params == nil {
 		params = &GetPasswordDataInput{}
@@ -55,8 +59,8 @@ type GetPasswordDataInput struct {
 
 	// Checks whether you have the required permissions for the action, without
 	// actually making the request, and provides an error response. If you have the
-	// required permissions, the error response is DryRunOperation. Otherwise, it is
-	// UnauthorizedOperation.
+	// required permissions, the error response is DryRunOperation . Otherwise, it is
+	// UnauthorizedOperation .
 	DryRun *bool
 
 	noSmithyDocumentSerde
@@ -81,6 +85,9 @@ type GetPasswordDataOutput struct {
 }
 
 func (c *Client) addOperationGetPasswordDataMiddlewares(stack *middleware.Stack, options Options) (err error) {
+	if err := stack.Serialize.Add(&setOperationInputMiddleware{}, middleware.After); err != nil {
+		return err
+	}
 	err = stack.Serialize.Add(&awsEc2query_serializeOpGetPasswordData{}, middleware.After)
 	if err != nil {
 		return err
@@ -89,34 +96,38 @@ func (c *Client) addOperationGetPasswordDataMiddlewares(stack *middleware.Stack,
 	if err != nil {
 		return err
 	}
+	if err := addProtocolFinalizerMiddlewares(stack, options, "GetPasswordData"); err != nil {
+		return fmt.Errorf("add protocol finalizers: %v", err)
+	}
+
+	if err = addlegacyEndpointContextSetter(stack, options); err != nil {
+		return err
+	}
 	if err = addSetLoggerMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddClientRequestIDMiddleware(stack); err != nil {
+	if err = addClientRequestID(stack); err != nil {
 		return err
 	}
-	if err = smithyhttp.AddComputeContentLengthMiddleware(stack); err != nil {
+	if err = addComputeContentLength(stack); err != nil {
 		return err
 	}
 	if err = addResolveEndpointMiddleware(stack, options); err != nil {
 		return err
 	}
-	if err = v4.AddComputePayloadSHA256Middleware(stack); err != nil {
+	if err = addComputePayloadSHA256(stack); err != nil {
 		return err
 	}
-	if err = addRetryMiddlewares(stack, options); err != nil {
+	if err = addRetry(stack, options); err != nil {
 		return err
 	}
-	if err = addHTTPSignerV4Middleware(stack, options); err != nil {
+	if err = addRawResponseToMetadata(stack); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRawResponseToMetadata(stack); err != nil {
+	if err = addRecordResponseTiming(stack); err != nil {
 		return err
 	}
-	if err = awsmiddleware.AddRecordResponseTiming(stack); err != nil {
-		return err
-	}
-	if err = addClientUserAgent(stack); err != nil {
+	if err = addClientUserAgent(stack, options); err != nil {
 		return err
 	}
 	if err = smithyhttp.AddErrorCloseResponseBodyMiddleware(stack); err != nil {
@@ -125,10 +136,22 @@ func (c *Client) addOperationGetPasswordDataMiddlewares(stack *middleware.Stack,
 	if err = smithyhttp.AddCloseResponseBodyMiddleware(stack); err != nil {
 		return err
 	}
+	if err = addSetLegacyContextSigningOptionsMiddleware(stack); err != nil {
+		return err
+	}
+	if err = addTimeOffsetBuild(stack, c); err != nil {
+		return err
+	}
+	if err = addUserAgentRetryMode(stack, options); err != nil {
+		return err
+	}
 	if err = addOpGetPasswordDataValidationMiddleware(stack); err != nil {
 		return err
 	}
 	if err = stack.Initialize.Add(newServiceMetadataMiddleware_opGetPasswordData(options.Region), middleware.Before); err != nil {
+		return err
+	}
+	if err = addRecursionDetection(stack); err != nil {
 		return err
 	}
 	if err = addRequestIDRetrieverMiddleware(stack); err != nil {
@@ -140,16 +163,11 @@ func (c *Client) addOperationGetPasswordDataMiddlewares(stack *middleware.Stack,
 	if err = addRequestResponseLogging(stack, options); err != nil {
 		return err
 	}
+	if err = addDisableHTTPSMiddleware(stack, options); err != nil {
+		return err
+	}
 	return nil
 }
-
-// GetPasswordDataAPIClient is a client that implements the GetPasswordData
-// operation.
-type GetPasswordDataAPIClient interface {
-	GetPasswordData(context.Context, *GetPasswordDataInput, ...func(*Options)) (*GetPasswordDataOutput, error)
-}
-
-var _ GetPasswordDataAPIClient = (*Client)(nil)
 
 // PasswordDataAvailableWaiterOptions are waiter options for
 // PasswordDataAvailableWaiter
@@ -158,16 +176,26 @@ type PasswordDataAvailableWaiterOptions struct {
 	// Set of options to modify how an operation is invoked. These apply to all
 	// operations invoked for this client. Use functional options on operation call to
 	// modify this list for per operation behavior.
+	//
+	// Passing options here is functionally equivalent to passing values to this
+	// config's ClientOptions field that extend the inner client's APIOptions directly.
 	APIOptions []func(*middleware.Stack) error
+
+	// Functional options to be passed to all operations invoked by this client.
+	//
+	// Function values that modify the inner APIOptions are applied after the waiter
+	// config's own APIOptions modifiers.
+	ClientOptions []func(*Options)
 
 	// MinDelay is the minimum amount of time to delay between retries. If unset,
 	// PasswordDataAvailableWaiter will use default minimum delay of 15 seconds. Note
 	// that MinDelay must resolve to a value lesser than or equal to the MaxDelay.
 	MinDelay time.Duration
 
-	// MaxDelay is the maximum amount of time to delay between retries. If unset or set
-	// to zero, PasswordDataAvailableWaiter will use default max delay of 120 seconds.
-	// Note that MaxDelay must resolve to value greater than or equal to the MinDelay.
+	// MaxDelay is the maximum amount of time to delay between retries. If unset or
+	// set to zero, PasswordDataAvailableWaiter will use default max delay of 120
+	// seconds. Note that MaxDelay must resolve to value greater than or equal to the
+	// MinDelay.
 	MaxDelay time.Duration
 
 	// LogWaitAttempts is used to enable logging for waiter retry attempts
@@ -175,12 +203,13 @@ type PasswordDataAvailableWaiterOptions struct {
 
 	// Retryable is function that can be used to override the service defined
 	// waiter-behavior based on operation output, or returned error. This function is
-	// used by the waiter to decide if a state is retryable or a terminal state. By
-	// default service-modeled logic will populate this option. This option can thus be
-	// used to define a custom waiter state with fall-back to service-modeled waiter
-	// state mutators.The function returns an error in case of a failure state. In case
-	// of retry state, this function returns a bool value of true and nil error, while
-	// in case of success it returns a bool value of false and nil error.
+	// used by the waiter to decide if a state is retryable or a terminal state.
+	//
+	// By default service-modeled logic will populate this option. This option can
+	// thus be used to define a custom waiter state with fall-back to service-modeled
+	// waiter state mutators.The function returns an error in case of a failure state.
+	// In case of retry state, this function returns a bool value of true and nil
+	// error, while in case of success it returns a bool value of false and nil error.
 	Retryable func(context.Context, *GetPasswordDataInput, *GetPasswordDataOutput, error) (bool, error)
 }
 
@@ -257,7 +286,16 @@ func (w *PasswordDataAvailableWaiter) WaitForOutput(ctx context.Context, params 
 		}
 
 		out, err := w.client.GetPasswordData(ctx, params, func(o *Options) {
+			baseOpts := []func(*Options){
+				addIsWaiterUserAgent,
+			}
 			o.APIOptions = append(o.APIOptions, apiOptions...)
+			for _, opt := range baseOpts {
+				opt(o)
+			}
+			for _, opt := range options.ClientOptions {
+				opt(o)
+			}
 		})
 
 		retryable, err := options.Retryable(ctx, params, out, err)
@@ -316,11 +354,18 @@ func passwordDataAvailableStateRetryable(ctx context.Context, input *GetPassword
 	return true, nil
 }
 
+// GetPasswordDataAPIClient is a client that implements the GetPasswordData
+// operation.
+type GetPasswordDataAPIClient interface {
+	GetPasswordData(context.Context, *GetPasswordDataInput, ...func(*Options)) (*GetPasswordDataOutput, error)
+}
+
+var _ GetPasswordDataAPIClient = (*Client)(nil)
+
 func newServiceMetadataMiddleware_opGetPasswordData(region string) *awsmiddleware.RegisterServiceMetadata {
 	return &awsmiddleware.RegisterServiceMetadata{
 		Region:        region,
 		ServiceID:     ServiceID,
-		SigningName:   "ec2",
 		OperationName: "GetPasswordData",
 	}
 }

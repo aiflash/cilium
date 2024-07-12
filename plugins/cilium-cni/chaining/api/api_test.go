@@ -8,19 +8,11 @@ import (
 	"testing"
 
 	cniTypesVer "github.com/containernetworking/cni/pkg/types/100"
-	"gopkg.in/check.v1"
+	"github.com/stretchr/testify/require"
 
 	"github.com/cilium/cilium/pkg/client"
 	"github.com/cilium/cilium/plugins/cilium-cni/lib"
 )
-
-func Test(t *testing.T) {
-	check.TestingT(t)
-}
-
-type APISuite struct{}
-
-var _ = check.Suite(&APISuite{})
 
 type pluginTest struct{}
 
@@ -28,33 +20,25 @@ func (p *pluginTest) Add(ctx context.Context, pluginContext PluginContext, cli *
 	return nil, nil
 }
 
-func (p *pluginTest) ImplementsAdd() bool {
-	return true
-}
-
-func (p *pluginTest) Delete(ctx context.Context, pluginContext PluginContext, cli *lib.DeletionFallbackClient) (err error) {
+func (p *pluginTest) Delete(ctx context.Context, pluginContext PluginContext, delClient *lib.DeletionFallbackClient) (err error) {
 	return nil
-}
-
-func (p *pluginTest) ImplementsDelete() bool {
-	return true
 }
 
 func (p *pluginTest) Check(ctx context.Context, pluginContext PluginContext, cli *client.Client) error {
 	return nil
 }
 
-func (a *APISuite) TestRegistration(c *check.C) {
+func TestRegistration(t *testing.T) {
 	err := Register("foo", &pluginTest{})
-	c.Assert(err, check.IsNil)
+	require.NoError(t, err)
 
 	err = Register("foo", &pluginTest{})
-	c.Assert(err, check.Not(check.IsNil))
+	require.Error(t, err)
 
 	err = Register(DefaultConfigName, &pluginTest{})
-	c.Assert(err, check.Not(check.IsNil))
+	require.Error(t, err)
 }
 
-func (a *APISuite) TestNonChaining(c *check.C) {
-	c.Assert(Lookup("cilium"), check.IsNil)
+func TestNonChaining(t *testing.T) {
+	require.Nil(t, Lookup("cilium"))
 }

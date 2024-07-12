@@ -10,5 +10,6 @@
 #define DEBUG
 #endif
 #define SECLABEL 2
-#define SECLABEL_NB 0xfffff
+#define SECLABEL_IPV4 2
+#define SECLABEL_IPV6 2
 #define CALLS_MAP test_cilium_calls_65535

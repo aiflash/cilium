@@ -12,6 +12,126 @@ Tuning Guide
 
 This guide helps you optimize a Cilium installation for optimal performance.
 
+Recommendation
+==============
+
+The default out of the box deployment of Cilium is focused on maximum compatibility
+rather than most optimal performance. If you are a performance-conscious user, here
+are the recommended settings for operating Cilium to get the best out of your setup.
+
+.. note::
+    In-place upgrade by just enabling the config settings on an existing
+    cluster is not possible since these tunings change the underlying datapath
+    fundamentals and therefore require Pod or even node restarts.
+
+    The best way to consume this for an existing cluster is to utilize per-node
+    configuration for enabling the tunings only on newly spawned nodes which join
+    the cluster. See the :ref:`per-node-configuration` page for more details.
+
+Each of the settings for the recommended performance profile are described in more
+detail on this page and in this `KubeCon talk <https://sched.co/1R2s5>`__:
+
+- netkit device mode
+- eBPF host-routing
+- BIG TCP for IPv4/IPv6
+- Bandwidth Manager (optional, for BBR congestion control)
+
+**Requirements:**
+
+* Kernel >= 6.8
+* Supported NICs for BIG TCP: mlx4, mlx5, ice
+
+To enable the first three settings:
+
+.. tabs::
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+           helm install cilium |CHART_RELEASE| \\
+             --namespace kube-system \\
+             --set routingMode=native \\
+             --set bpf.datapathMode=netkit \\
+             --set bpf.masquerade=true \\
+             --set ipv6.enabled=true \\
+             --set enableIPv6BIGTCP=true \\
+             --set ipv4.enabled=true \\
+             --set enableIPv4BIGTCP=true \\
+             --set kubeProxyReplacement=true
+
+For enabling BBR congestion control in addition, consider adding the following
+settings to the above Helm install:
+
+.. tabs::
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+             --set bandwidthManager.enabled=true \\
+             --set bandwidthManager.bbr=true
+
+.. _netkit:
+
+netkit device mode
+==================
+
+netkit devices provide connectivity for Pods with the goal to improve throughput
+and latency for applications as if they would have resided directly in the host
+namespace, meaning, it reduces the datapath overhead for network namespaces down
+to zero. The `netkit driver in the kernel <https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/drivers/net/netkit.c>`__
+has been specifically designed for Cilium's needs and replaces the old-style veth
+device type. See also the `KubeCon talk on netkit <https://sched.co/1R2s5>`__ for
+more details.
+
+Cilium utilizes netkit in L3 device mode with blackholing traffic from the Pods
+when there is no BPF program attached. The Pod specific BPF programs are attached
+inside the netkit peer device, and can only be managed from the host namespace
+through Cilium. netkit in combination with eBPF-based host-routing achieves a
+fast network namespace switch for off-node traffic ingressing into the Pod or
+leaving the Pod. When netkit is enabled, Cilium also utilizes tcx for all
+attachments to non-netkit devices. This is done for higher efficiency as well
+as utilizing BPF links for all Cilium attachments. netkit is available for kernel
+6.8 and onwards and it also supports BIG TCP. Once the base kernels become more
+ubiquitous, the veth device mode of Cilium will be deprecated.
+
+To validate whether your installation is running with netkit, run ``cilium status``
+in any of the Cilium Pods and look for the line reporting the status for
+"Device Mode" which should state "netkit". Also, ensure to have eBPF host
+routing enabled - the reporting status under "Host Routing" must state "BPF".
+
+.. note::
+    In-place upgrade by just enabling netkit on an existing cluster is not
+    possible since the CNI plugin cannot simply replace veth with netkit after
+    Pod creation. Also, running both flavors in parallel is currently not
+    supported.
+
+    The best way to consume this for an existing cluster is to utilize per-node
+    configuration for enabling netkit on newly spawned nodes which join the
+    cluster. See the :ref:`per-node-configuration` page for more details.
+
+**Requirements:**
+
+* Kernel >= 6.8
+* Direct-routing configuration or tunneling
+* eBPF host-routing
+
+To enable netkit device mode with eBPF host-routing:
+
+.. tabs::
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+           helm install cilium |CHART_RELEASE| \\
+             --namespace kube-system \\
+             --set routingMode=native \\
+             --set bpf.datapathMode=netkit \\
+             --set bpf.masquerade=true \\
+             --set kubeProxyReplacement=true
+
 .. _eBPF_Host_Routing:
 
 eBPF Host-Routing
@@ -47,16 +167,33 @@ IPv6 BIG TCP
 IPv6 BIG TCP allows the network stack to prepare larger GSO (transmit) and GRO
 (receive) packets to reduce the number of times the stack is traversed which
 improves performance and latency. It reduces the CPU load and helps achieve
-higher speeds (i.e. 100Gbit/s and beyond). To pass such packets through the stack
-BIG TCP adds a temporary Hop-By-Hop header after the IPv6 one which is stripped
-before transmitting the packet over the wire. BIG TCP can operate in a DualStack
-setup, IPv4 packets will use the old lower limits (64k) and IPv6 packets will
-use the new larger ones (192k). Note that Cilium assumes the default kernel values
-for GSO and GRO maximum sizes are 64k and adjusts them only when necessary, i.e. if
-BIG TCP is enabled and the current GSO/GRO maximum sizes are less than 192k it
-will try to increase them, respectively when BIG TCP is disabled and the current
-maximum values are more than 64k it will try to decrease them. BIG TCP doesn't
-require network interface MTU changes.
+higher speeds (i.e. 100Gbit/s and beyond).
+
+To pass such packets through the stack BIG TCP adds a temporary Hop-By-Hop header
+after the IPv6 one which is stripped before transmitting the packet over the wire.
+
+BIG TCP can operate in a DualStack setup, IPv4 packets will use the old lower
+limits (64k) if IPv4 BIG TCP is not enabled, and IPv6 packets will use the new
+larger ones (192k). Both IPv4 BIG TCP and IPv6 BIG TCP can be enabled so that
+both use the larger one (192k).
+
+Note that Cilium assumes the default kernel values for GSO and GRO maximum sizes
+are 64k and adjusts them only when necessary, i.e. if BIG TCP is enabled and the
+current GSO/GRO maximum sizes are less than 192k it will try to increase them,
+respectively when BIG TCP is disabled and the current maximum values are more
+than 64k it will try to decrease them.
+
+BIG TCP doesn't require network interface MTU changes.
+
+.. note::
+    In-place upgrade by just enabling BIG TCP on an existing cluster is currently
+    not possible since Cilium does not have access into Pods after they have been
+    created.
+
+    The best way to consume this for an existing cluster is to either restart Pods
+    or to utilize per-node configuration for enabling BIG TCP on newly spawned nodes
+    which join the cluster. See the :ref:`per-node-configuration` page for more
+    details.
 
 **Requirements:**
 
@@ -65,7 +202,7 @@ require network interface MTU changes.
 * eBPF-based kube-proxy replacement
 * eBPF-based masquerading
 * Tunneling and encryption disabled
-* Supported NICs: mlx4, mlx5
+* Supported NICs: mlx4, mlx5, ice
 
 To enable IPv6 BIG TCP:
 
@@ -80,9 +217,8 @@ To enable IPv6 BIG TCP:
              --set routingMode=native \\
              --set bpf.masquerade=true \\
              --set ipv6.enabled=true \\
-             --set enableIPv6Masquerade=false \\
              --set enableIPv6BIGTCP=true \\
-             --set kubeProxyReplacement=strict
+             --set kubeProxyReplacement=true
 
 Note that after toggling the IPv6 BIG TCP option the Kubernetes Pods must be
 restarted for the changes to take effect.
@@ -90,6 +226,73 @@ restarted for the changes to take effect.
 To validate whether your installation is running with IPv6 BIG TCP,
 run ``cilium status`` in any of the Cilium pods and look for the line
 reporting the status for "IPv6 BIG TCP" which should state "enabled".
+
+IPv4 BIG TCP
+============
+
+Similar to IPv6 BIG TCP, IPv4 BIG TCP allows the network stack to prepare larger
+GSO (transmit) and GRO (receive) packets to reduce the number of times the stack
+is traversed which improves performance and latency. It reduces the CPU load and
+helps achieve higher speeds (i.e. 100Gbit/s and beyond).
+
+To pass such packets through the stack BIG TCP sets IPv4 tot_len to 0 and uses
+skb->len as the real IPv4 total length. The proper IPv4 tot_len is set before
+transmitting the packet over the wire.
+
+BIG TCP can operate in a DualStack setup, IPv6 packets will use the old lower
+limits (64k) if IPv6 BIG TCP is not enabled, and IPv4 packets will use the new
+larger ones (192k). Both IPv4 BIG TCP and IPv6 BIG TCP can be enabled so that
+both use the larger one (192k).
+
+Note that Cilium assumes the default kernel values for GSO and GRO maximum sizes
+are 64k and adjusts them only when necessary, i.e. if BIG TCP is enabled and the
+current GSO/GRO maximum sizes are less than 192k it will try to increase them,
+respectively when BIG TCP is disabled and the current maximum values are more
+than 64k it will try to decrease them.
+
+BIG TCP doesn't require network interface MTU changes.
+
+.. note::
+    In-place upgrade by just enabling BIG TCP on an existing cluster is currently
+    not possible since Cilium does not have access into Pods after they have been
+    created.
+
+    The best way to consume this for an existing cluster is to either restart Pods
+    or to utilize per-node configuration for enabling BIG TCP on newly spawned nodes
+    which join the cluster. See the :ref:`per-node-configuration` page for more
+    details.
+
+**Requirements:**
+
+* Kernel >= 6.3
+* eBPF Host-Routing
+* eBPF-based kube-proxy replacement
+* eBPF-based masquerading
+* Tunneling and encryption disabled
+* Supported NICs: mlx4, mlx5, ice
+
+To enable IPv4 BIG TCP:
+
+.. tabs::
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+           helm install cilium |CHART_RELEASE| \\
+             --namespace kube-system \\
+             --set routingMode=native \\
+             --set bpf.masquerade=true \\
+             --set ipv4.enabled=true \\
+             --set enableIPv4BIGTCP=true \\
+             --set kubeProxyReplacement=true
+
+Note that after toggling the IPv4 BIG TCP option the Kubernetes Pods
+must be restarted for the changes to take effect.
+
+To validate whether your installation is running with IPv4 BIG TCP,
+run ``cilium status`` in any of the Cilium pods and look for the line
+reporting the status for "IPv4 BIG TCP" which should state "enabled".
 
 Bypass iptables Connection Tracking
 ===================================
@@ -113,9 +316,11 @@ To enable the iptables connection-tracking bypass:
 
     .. group-tab:: Cilium CLI
 
-       .. code-block:: shell-session
+       .. parsed-literal::
 
-          cilium install --config install-no-conntrack-iptables-rules=true
+          cilium install |CHART_VERSION| \\
+            --set installNoConntrackIptablesRules=true \\
+            --set kubeProxyReplacement=true
 
     .. group-tab:: Helm
 
@@ -124,7 +329,7 @@ To enable the iptables connection-tracking bypass:
            helm install cilium |CHART_RELEASE| \\
              --namespace kube-system \\
              --set installNoConntrackIptablesRules=true \\
-             --set kubeProxyReplacement=strict
+             --set kubeProxyReplacement=true
 
 Hubble
 ======
@@ -133,7 +338,51 @@ Running with Hubble observability enabled can come at the expense of
 performance. The overhead of Hubble is somewhere between 1-15% depending
 on your network traffic patterns and Hubble aggregation settings.
 
-In order to optimize for maximum performance, Hubble can be disabled:
+In clusters with a huge amount of network traffic, cilium-agent might spend
+a significant portion of CPU time on processing monitored events when Hubble
+is enabled. To prevent high CPU utilization in such a case, you can set limits
+on how many events can be generated by datapath code. Two limits are possible
+to configure:
+
+* Rate limit - limits how many events on average can be generated
+* Burst limit - limits the number of events that can be generated in a span of 1 second
+
+When both limits are set to 0, no BPF events rate limiting is imposed.
+
+.. note::
+
+    Helm configuration for BPF events map rate limiting is experimental and might
+    change in upcoming releases.
+
+.. warning::
+
+    When BPF events map rate limiting is enabled, Cilium monitor,
+    Hubble observability, Hubble metrics reliability, and Hubble export functionalities
+    might be impacted due to dropped events.
+
+To enable eBPF Event Rate Limiting with a rate limit of 10,000 and a burst limit of 50,000:
+
+.. tabs::
+
+    .. group-tab:: Cilium CLI
+
+       .. parsed-literal::
+
+           cilium install |CHART_VERSION| \\
+             --set bpf.events.default.rateLimit=10000 \\
+             --set bpf.events.default.burstLimit=50000
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+           helm install cilium |CHART_RELEASE| \\
+             --namespace kube-system \\
+             --set bpf.events.default.rateLimit=10000 \\
+             --set bpf.events.default.burstLimit=50000
+
+If this is not sufficient, in order to optimize for maximum performance,
+you can disable Hubble:
 
 .. tabs::
 
@@ -150,6 +399,31 @@ In order to optimize for maximum performance, Hubble can be disabled:
            helm install cilium |CHART_RELEASE| \\
              --namespace kube-system \\
              --set hubble.enabled=false
+
+You can also choose to stop exposing event types in which you
+are not interested. For instance if you are mainly interested in
+dropped traffic, you can disable "trace" events which will likely reduce
+the overall CPU consumption of the agent.
+
+.. tabs::
+
+    .. group-tab:: Cilium CLI
+
+       .. code-block:: shell-session
+
+           cilium config TraceNotification=disable
+
+    .. group-tab:: Helm
+
+       .. parsed-literal::
+
+           helm install cilium |CHART_RELEASE| \\
+             --namespace kube-system \\
+             --set bpf.events.trace.enabled=false
+
+.. warning::
+
+    Suppressing one or more event types will impact ``cilium monitor`` as well as Hubble observability capabilities, metrics and exports.
 
 MTU
 ===
@@ -192,7 +466,7 @@ To enable the Bandwidth Manager:
            helm install cilium |CHART_RELEASE| \\
              --namespace kube-system \\
              --set bandwidthManager.enabled=true \\
-             --set kubeProxyReplacement=strict
+             --set kubeProxyReplacement=true
 
 To validate whether your installation is running with Bandwidth Manager,
 run ``cilium status`` in any of the Cilium pods and look for the line
@@ -222,6 +496,18 @@ BBR also needs eBPF Host-Routing in order to retain the network packet's socket
 association all the way until the packet hits the FQ queueing discipline on the
 physical device in the host namespace.
 
+.. note::
+    In-place upgrade by just enabling BBR on an existing cluster is not possible
+    since Cilium cannot migrate existing sockets over to BBR congestion control.
+
+    The best way to consume this is to either only enable it on newly built clusters,
+    to restart Pods on existing clusters, or to utilize per-node configuration for
+    enabling BBR on newly spawned nodes which join the cluster. See the
+    :ref:`per-node-configuration` page for more details.
+
+    Note that the use of BBR could lead to a higher amount of TCP retransmissions
+    and more aggressive behavior towards TCP CUBIC connections.
+
 **Requirements:**
 
 * Kernel >= 5.18
@@ -240,7 +526,7 @@ To enable the Bandwidth Manager with BBR for Pods:
              --namespace kube-system \\
              --set bandwidthManager.enabled=true \\
              --set bandwidthManager.bbr=true \\
-             --set kubeProxyReplacement=strict
+             --set kubeProxyReplacement=true
 
 To validate whether your installation is running with BBR for Pods,
 run ``cilium status`` in any of the Cilium pods and look for the line
@@ -296,7 +582,7 @@ likely it is that various datapath optimizations can be used.
 
 In our Cilium release blogs, we also regularly highlight some of the eBPF based
 kernel work we conduct which implicitly helps Cilium's datapath performance
-such as `replacing retpolines with direct jumps in the eBPF JIT <https://cilium.io/blog/2020/02/18/cilium-17#linux-kernel-changes>`_.
+such as `replacing retpolines with direct jumps in the eBPF JIT <https://cilium.io/blog/2020/02/18/cilium-17#upstream-linux>`_.
 
 Moreover, the kernel allows to configure several options which will help maximize
 network performance.

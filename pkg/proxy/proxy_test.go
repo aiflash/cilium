@@ -5,168 +5,245 @@ package proxy
 
 import (
 	"context"
+	"os"
 	"testing"
 
-	testipcache "github.com/cilium/cilium/pkg/testutils/ipcache"
+	"github.com/stretchr/testify/require"
 
-	. "gopkg.in/check.v1"
+	"github.com/cilium/cilium/pkg/completion"
+	"github.com/cilium/cilium/pkg/envoy"
+	"github.com/cilium/cilium/pkg/policy"
+	endpointtest "github.com/cilium/cilium/pkg/proxy/endpoint/test"
+	"github.com/cilium/cilium/pkg/proxy/types"
+	"github.com/cilium/cilium/pkg/time"
+	"github.com/cilium/cilium/pkg/trigger"
+	"github.com/cilium/cilium/pkg/u8proto"
 )
-
-func Test(t *testing.T) { TestingT(t) }
-
-type ProxySuite struct{}
-
-var _ = Suite(&ProxySuite{})
 
 type MockDatapathUpdater struct{}
 
-func (m *MockDatapathUpdater) InstallProxyRules(ctx context.Context, proxyPort uint16, ingress, localOnly bool, name string) error {
-	return nil
+func (m *MockDatapathUpdater) InstallProxyRules(proxyPort uint16, name string) {
 }
 
 func (m *MockDatapathUpdater) SupportsOriginalSourceAddr() bool {
 	return true
 }
 
-func (s *ProxySuite) TestPortAllocator(c *C) {
+func (m *MockDatapathUpdater) GetProxyPorts() map[string]uint16 {
+	return nil
+}
+
+func proxyForTest() (*Proxy, func()) {
 	mockDatapathUpdater := &MockDatapathUpdater{}
+	p := createProxy(10000, 20000, mockDatapathUpdater, nil, nil)
+	triggerDone := make(chan struct{})
+	p.proxyPortsTrigger, _ = trigger.NewTrigger(trigger.Parameters{
+		MinInterval:  10 * time.Second,
+		TriggerFunc:  func(reasons []string) {},
+		ShutdownFunc: func() { close(triggerDone) },
+	})
+	return p, func() {
+		p.proxyPortsTrigger.Shutdown()
+		<-triggerDone
+	}
+}
 
-	stateDir := c.MkDir()
-	p := StartProxySupport(10000, 20000, stateDir, nil, nil, mockDatapathUpdater, nil,
-		testipcache.NewMockIPCache())
+func TestPortAllocator(t *testing.T) {
+	testRunDir := t.TempDir()
+	socketDir := envoy.GetSocketDir(testRunDir)
+	err := os.MkdirAll(socketDir, 0700)
+	require.NoError(t, err)
 
-	port, err := p.AllocateProxyPort("listener1", false, true)
-	c.Assert(err, IsNil)
-	c.Assert(port, Not(Equals), 0)
+	p, cleaner := proxyForTest()
+	defer cleaner()
 
-	port1, err := GetProxyPort("listener1")
-	c.Assert(err, IsNil)
-	c.Assert(port1, Equals, port)
+	port, err := p.AllocateCRDProxyPort("listener1")
+	require.NoError(t, err)
+	require.NotEqual(t, 0, port)
+
+	port1, _, err := p.GetProxyPort("listener1")
+	require.NoError(t, err)
+	require.Equal(t, port, port1)
 
 	// Another allocation for the same name gets the same port
-	port1a, err := p.AllocateProxyPort("listener1", false, true)
-	c.Assert(err, IsNil)
-	c.Assert(port1a, Equals, port1)
+	port1a, err := p.AllocateCRDProxyPort("listener1")
+	require.NoError(t, err)
+	require.Equal(t, port1, port1a)
 
-	name, pp := findProxyPortByType(ProxyTypeCRD, "listener1", false)
-	c.Assert(name, Equals, "listener1")
-	c.Assert(pp.proxyType, Equals, ProxyTypeCRD)
-	c.Assert(pp.proxyPort, Equals, port)
-	c.Assert(pp.ingress, Equals, false)
-	c.Assert(pp.localOnly, Equals, true)
-	c.Assert(pp.configured, Equals, true)
-	c.Assert(pp.isStatic, Equals, false)
-	c.Assert(pp.nRedirects, Equals, 0)
-	c.Assert(pp.rulesPort, Equals, uint16(0))
+	name, pp := p.findProxyPortByType(types.ProxyTypeCRD, "listener1", false)
+	require.Equal(t, "listener1", name)
+	require.Equal(t, types.ProxyTypeCRD, pp.ProxyType)
+	require.Equal(t, port, pp.ProxyPort)
+	require.Equal(t, false, pp.Ingress)
+	require.Equal(t, true, pp.configured)
+	require.Equal(t, false, pp.isStatic)
+	require.Equal(t, 0, pp.nRedirects)
+	require.Equal(t, uint16(0), pp.rulesPort)
 
 	err = p.ReleaseProxyPort("listener1")
-	c.Assert(err, IsNil)
+	require.NoError(t, err)
 
 	// ProxyPort lingers and can still be found, but it's port is zeroed
-	port1b, err := GetProxyPort("listener1")
-	c.Assert(err, IsNil)
-	c.Assert(port1b, Equals, uint16(0))
-	c.Assert(pp.proxyPort, Equals, uint16(0))
-	c.Assert(pp.configured, Equals, false)
-	c.Assert(pp.nRedirects, Equals, 0)
+	port1b, _, err := p.GetProxyPort("listener1")
+	require.NoError(t, err)
+	require.Equal(t, uint16(0), port1b)
+	require.Equal(t, uint16(0), pp.ProxyPort)
+	require.Equal(t, false, pp.configured)
+	require.Equal(t, 0, pp.nRedirects)
 
 	// the port was never acked, so rulesPort is 0
-	c.Assert(pp.rulesPort, Equals, uint16(0))
+	require.Equal(t, uint16(0), pp.rulesPort)
 
 	// Allocates a different port (due to port was never acked)
-	port2, err := p.AllocateProxyPort("listener1", true, false)
-	c.Assert(err, IsNil)
-	c.Assert(port2, Not(Equals), port)
-	c.Assert(pp.proxyType, Equals, ProxyTypeCRD)
-	c.Assert(pp.ingress, Equals, false)
-	c.Assert(pp.localOnly, Equals, true)
-	c.Assert(pp.proxyPort, Equals, port2)
-	c.Assert(pp.configured, Equals, true)
-	c.Assert(pp.isStatic, Equals, false)
-	c.Assert(pp.nRedirects, Equals, 0)
-	c.Assert(pp.rulesPort, Equals, uint16(0))
+	port2, err := p.AllocateCRDProxyPort("listener1")
+	require.NoError(t, err)
+	require.NotEqual(t, port, port2)
+	name2, pp2 := p.findProxyPortByType(types.ProxyTypeCRD, "listener1", false)
+	require.Equal(t, name2, name)
+	require.Equal(t, pp2, pp)
+	require.Equal(t, types.ProxyTypeCRD, pp.ProxyType)
+	require.Equal(t, false, pp.Ingress)
+	require.Equal(t, port2, pp.ProxyPort)
+	require.Equal(t, true, pp.configured)
+	require.Equal(t, false, pp.isStatic)
+	require.Equal(t, 0, pp.nRedirects)
+	require.Equal(t, uint16(0), pp.rulesPort)
 
 	// Ack configures the port to the datapath
 	err = p.AckProxyPort(context.TODO(), "listener1")
-	c.Assert(err, IsNil)
-	c.Assert(pp.nRedirects, Equals, 1)
-	c.Assert(pp.rulesPort, Equals, port2)
+	require.NoError(t, err)
+	require.Equal(t, 1, pp.nRedirects)
+	require.Equal(t, port2, pp.rulesPort)
 
 	// Another Ack takes another reference
 	err = p.AckProxyPort(context.TODO(), "listener1")
-	c.Assert(err, IsNil)
-	c.Assert(pp.nRedirects, Equals, 2)
-	c.Assert(pp.rulesPort, Equals, port2)
+	require.NoError(t, err)
+	require.Equal(t, 2, pp.nRedirects)
+	require.Equal(t, port2, pp.rulesPort)
 
 	// 1st release decreases the count
 	err = p.ReleaseProxyPort("listener1")
-	c.Assert(err, IsNil)
-	c.Assert(pp.nRedirects, Equals, 1)
-	c.Assert(pp.configured, Equals, true)
-	c.Assert(pp.proxyPort, Equals, port2)
+	require.NoError(t, err)
+	require.Equal(t, 1, pp.nRedirects)
+	require.Equal(t, true, pp.configured)
+	require.Equal(t, port2, pp.ProxyPort)
 
 	// 2nd release decreases the count to zero
 	err = p.ReleaseProxyPort("listener1")
-	c.Assert(err, IsNil)
-	c.Assert(pp.nRedirects, Equals, 0)
-	c.Assert(pp.configured, Equals, false)
-	c.Assert(pp.proxyPort, Equals, uint16(0))
-	c.Assert(pp.rulesPort, Equals, port2)
+	require.NoError(t, err)
+	require.Equal(t, 0, pp.nRedirects)
+	require.Equal(t, false, pp.configured)
+	require.Equal(t, uint16(0), pp.ProxyPort)
+	require.Equal(t, port2, pp.rulesPort)
 
 	// extra releases are idempotent
 	err = p.ReleaseProxyPort("listener1")
-	c.Assert(err, IsNil)
-	c.Assert(pp.nRedirects, Equals, 0)
-	c.Assert(pp.configured, Equals, false)
-	c.Assert(pp.proxyPort, Equals, uint16(0))
-	c.Assert(pp.rulesPort, Equals, port2)
+	require.NoError(t, err)
+	require.Equal(t, 0, pp.nRedirects)
+	require.Equal(t, false, pp.configured)
+	require.Equal(t, uint16(0), pp.ProxyPort)
+	require.Equal(t, port2, pp.rulesPort)
 
 	// mimic some other process taking the port
-	allocatedPorts[port2] = true
+	p.allocatedPorts[port2] = true
 
 	// Allocate again, this time a different port is allocated
-	port3, err := p.AllocateProxyPort("listener1", true, true)
-	c.Assert(err, IsNil)
-	c.Assert(port3, Not(Equals), uint16(0))
-	c.Assert(port3, Not(Equals), port2)
-	c.Assert(port3, Not(Equals), port1)
-	c.Assert(pp.proxyType, Equals, ProxyTypeCRD)
-	c.Assert(pp.ingress, Equals, false)
-	c.Assert(pp.localOnly, Equals, true)
-	c.Assert(pp.proxyPort, Equals, port3)
-	c.Assert(pp.configured, Equals, true)
-	c.Assert(pp.isStatic, Equals, false)
-	c.Assert(pp.nRedirects, Equals, 0)
-	c.Assert(pp.rulesPort, Equals, port2)
+	port3, err := p.AllocateCRDProxyPort("listener1")
+	require.NoError(t, err)
+	require.NotEqual(t, uint16(0), port3)
+	require.NotEqual(t, port2, port3)
+	require.NotEqual(t, port1, port3)
+	name2, pp2 = p.findProxyPortByType(types.ProxyTypeCRD, "listener1", false)
+	require.Equal(t, name2, name)
+	require.Equal(t, pp2, pp)
+	require.Equal(t, types.ProxyTypeCRD, pp.ProxyType)
+	require.Equal(t, false, pp.Ingress)
+	require.Equal(t, port3, pp.ProxyPort)
+	require.Equal(t, true, pp.configured)
+	require.Equal(t, false, pp.isStatic)
+	require.Equal(t, 0, pp.nRedirects)
+	require.Equal(t, port2, pp.rulesPort)
 
 	// Ack configures the port to the datapath
 	err = p.AckProxyPort(context.TODO(), "listener1")
-	c.Assert(err, IsNil)
-	c.Assert(pp.nRedirects, Equals, 1)
-	c.Assert(pp.rulesPort, Equals, port3)
+	require.NoError(t, err)
+	require.Equal(t, 1, pp.nRedirects)
+	require.Equal(t, port3, pp.rulesPort)
 
 	// Release marks the port as unallocated
 	err = p.ReleaseProxyPort("listener1")
-	c.Assert(err, IsNil)
-	c.Assert(pp.nRedirects, Equals, 0)
-	c.Assert(pp.configured, Equals, false)
-	c.Assert(pp.proxyPort, Equals, uint16(0))
-	c.Assert(pp.rulesPort, Equals, port3)
+	require.NoError(t, err)
+	require.Equal(t, 0, pp.nRedirects)
+	require.Equal(t, false, pp.configured)
+	require.Equal(t, uint16(0), pp.ProxyPort)
+	require.Equal(t, port3, pp.rulesPort)
 
-	inuse, exists := allocatedPorts[port3]
-	c.Assert(exists, Equals, true)
-	c.Assert(inuse, Equals, false)
+	inuse, exists := p.allocatedPorts[port3]
+	require.Equal(t, true, exists)
+	require.Equal(t, false, inuse)
 
 	// No-one used the port so next allocation gets the same port again
-	port4, err := p.AllocateProxyPort("listener1", true, true)
-	c.Assert(err, IsNil)
-	c.Assert(port4, Equals, port3)
-	c.Assert(pp.proxyType, Equals, ProxyTypeCRD)
-	c.Assert(pp.ingress, Equals, false)
-	c.Assert(pp.localOnly, Equals, true)
-	c.Assert(pp.proxyPort, Equals, port4)
-	c.Assert(pp.configured, Equals, true)
-	c.Assert(pp.isStatic, Equals, false)
-	c.Assert(pp.nRedirects, Equals, 0)
-	c.Assert(pp.rulesPort, Equals, port3)
+	port4, err := p.AllocateCRDProxyPort("listener1")
+	require.NoError(t, err)
+	require.Equal(t, port3, port4)
+	require.Equal(t, types.ProxyTypeCRD, pp.ProxyType)
+	require.Equal(t, false, pp.Ingress)
+	require.Equal(t, port4, pp.ProxyPort)
+	require.Equal(t, true, pp.configured)
+	require.Equal(t, false, pp.isStatic)
+	require.Equal(t, 0, pp.nRedirects)
+	require.Equal(t, port3, pp.rulesPort)
+}
+
+type fakeProxyPolicy struct{}
+
+func (p *fakeProxyPolicy) CopyL7RulesPerEndpoint() policy.L7DataMap {
+	return policy.L7DataMap{}
+}
+
+func (p *fakeProxyPolicy) GetL7Parser() policy.L7ParserType {
+	return policy.ParserTypeCRD
+}
+
+func (p *fakeProxyPolicy) GetIngress() bool {
+	return false
+}
+
+func (p *fakeProxyPolicy) GetPort() uint16 {
+	return uint16(80)
+}
+
+func (p *fakeProxyPolicy) GetProtocol() uint8 {
+	return uint8(u8proto.UDP)
+}
+
+func (p *fakeProxyPolicy) GetListener() string {
+	return "nonexisting-listener"
+}
+
+func TestCreateOrUpdateRedirectMissingListener(t *testing.T) {
+	testRunDir := t.TempDir()
+	socketDir := envoy.GetSocketDir(testRunDir)
+	err := os.MkdirAll(socketDir, 0700)
+	require.NoError(t, err)
+
+	p, cleaner := proxyForTest()
+	defer cleaner()
+
+	ep := &endpointtest.ProxyUpdaterMock{
+		Id:   1000,
+		Ipv4: "10.0.0.1",
+		Ipv6: "f00d::1",
+	}
+
+	l4 := &fakeProxyPolicy{}
+
+	ctx := context.TODO()
+	wg := completion.NewWaitGroup(ctx)
+
+	proxyPort, err, finalizeFunc, revertFunc := p.CreateOrUpdateRedirect(ctx, l4, "dummy-proxy-id", ep, wg)
+	require.Equal(t, uint16(0), proxyPort)
+	require.Error(t, err)
+	require.Nil(t, finalizeFunc)
+	require.Nil(t, revertFunc)
 }

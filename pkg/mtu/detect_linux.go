@@ -16,8 +16,15 @@ import (
 )
 
 const (
-	externalProbeIPv4 = "1.1.1.1"
-	externalProbeIPv6 = "2606:4700:4700::1111"
+	// externalProbeIPv4 is an IPv4 address specifically designed for tests. We
+	// only want to retrieve default route for external IP addresses, thus it
+	// doesn't need to be a real address.
+	externalProbeIPv4 = "203.0.113.1"
+
+	// externalProbeIPv6 is an IPv4 address specifically designed for tests. We
+	// only want to retrieve default route for external IP addresses, thus it
+	// doesn't need to be a real address.
+	externalProbeIPv6 = "2001:db8::1"
 )
 
 func getRoute(externalProbe string) ([]netlink.Route, error) {
@@ -47,7 +54,7 @@ func autoDetect() (int, error) {
 		prevErr := err
 		routes, err = getRoute(externalProbeIPv6)
 		if err != nil {
-			return 0, fmt.Errorf("%v, %v", err.Error(), prevErr.Error())
+			return 0, fmt.Errorf("%w: %w", err, prevErr)
 		}
 	}
 

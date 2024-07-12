@@ -41,11 +41,13 @@ cilium-bugtool [OPTIONS] [flags]
       --get-pprof                            When set, only gets the pprof traces from the cilium-agent binary
   -h, --help                                 help for cilium-bugtool
   -H, --host string                          URI to server-side API
+      --hubble-metrics                       When set, hubble prometheus metrics (default true)
+      --hubble-metrics-port int              Port to query for hubble metrics (default 9965)
       --k8s-label string                     Kubernetes label for Cilium pod (default "k8s-app=cilium")
       --k8s-mode                             Require Kubernetes pods to be found or fail
       --k8s-namespace string                 Kubernetes namespace for Cilium pod (default "kube-system")
       --parallel-workers int                 Maximum number of parallel worker tasks, use 0 for number of CPUs
-      --pprof-debug int                      Debug pprof args (default 1)
+      --pprof-debug int                      Debug pprof args
       --pprof-port int                       Pprof port to connect to. Known Cilium component ports are agent:6060, operator:6061, apiserver:6063 (default 6060)
       --pprof-trace-seconds int              Amount of seconds used for pprof CPU traces (default 180)
   -t, --tmp string                           Path to store extracted files. Use '-' to send to stdout. (default "/tmp")

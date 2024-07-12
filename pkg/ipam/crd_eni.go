@@ -7,17 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	eniTypes "github.com/cilium/cilium/pkg/aws/eni/types"
 	"github.com/cilium/cilium/pkg/backoff"
 	"github.com/cilium/cilium/pkg/defaults"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-
-	"github.com/sirupsen/logrus"
-	"github.com/vishvananda/netlink"
-	"golang.org/x/sys/unix"
+	"github.com/cilium/cilium/pkg/time"
 )
 
 type eniDeviceConfig struct {
@@ -136,19 +136,19 @@ func waitForNetlinkDevices(configByMac configMap) (linkByMac linkMap, err error)
 	for try := 0; try < waitForNetlinkDevicesMaxTries; try++ {
 		links, err := netlink.LinkList()
 		if err != nil {
-			return nil, fmt.Errorf("failed to obtain eni link list: %w", err)
-		}
-
-		linkByMac = linkMap{}
-		for _, link := range links {
-			mac := link.Attrs().HardwareAddr.String()
-			if _, ok := configByMac[mac]; ok {
-				linkByMac[mac] = link
+			log.WithError(err).Warn("failed to obtain eni link list - retrying")
+		} else {
+			linkByMac = linkMap{}
+			for _, link := range links {
+				mac := link.Attrs().HardwareAddr.String()
+				if _, ok := configByMac[mac]; ok {
+					linkByMac[mac] = link
+				}
 			}
-		}
 
-		if len(linkByMac) == len(configByMac) {
-			return linkByMac, nil
+			if len(linkByMac) == len(configByMac) {
+				return linkByMac, nil
+			}
 		}
 
 		sleep := backoff.CalculateDuration(

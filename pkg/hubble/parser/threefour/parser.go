@@ -4,8 +4,6 @@
 package threefour
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"strings"
@@ -24,6 +22,7 @@ import (
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/monitor"
 	monitorAPI "github.com/cilium/cilium/pkg/monitor/api"
+	"github.com/cilium/cilium/pkg/policy/correlation"
 )
 
 // Parser is a parser for L3/L4 payloads
@@ -97,26 +96,28 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 		return errors.ErrEmptyData
 	}
 
+	eventType := data[0]
+
 	var packetOffset int
-	var eventType uint8
-	eventType = data[0]
 	var dn *monitor.DropNotify
 	var tn *monitor.TraceNotify
 	var pvn *monitor.PolicyVerdictNotify
 	var dbg *monitor.DebugCapture
 	var eventSubType uint8
+	var authType pb.AuthType
+
 	switch eventType {
 	case monitorAPI.MessageTypeDrop:
 		packetOffset = monitor.DropNotifyLen
 		dn = &monitor.DropNotify{}
-		if err := binary.Read(bytes.NewReader(data), byteorder.Native, dn); err != nil {
-			return fmt.Errorf("failed to parse drop: %v", err)
+		if err := monitor.DecodeDropNotify(data, dn); err != nil {
+			return fmt.Errorf("failed to parse drop: %w", err)
 		}
 		eventSubType = dn.SubType
 	case monitorAPI.MessageTypeTrace:
 		tn = &monitor.TraceNotify{}
 		if err := monitor.DecodeTraceNotify(data, tn); err != nil {
-			return fmt.Errorf("failed to parse trace: %v", err)
+			return fmt.Errorf("failed to parse trace: %w", err)
 		}
 		eventSubType = tn.ObsPoint
 
@@ -131,14 +132,15 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 		packetOffset = (int)(tn.DataOffset())
 	case monitorAPI.MessageTypePolicyVerdict:
 		pvn = &monitor.PolicyVerdictNotify{}
-		if err := binary.Read(bytes.NewReader(data), byteorder.Native, pvn); err != nil {
-			return fmt.Errorf("failed to parse policy verdict: %v", err)
+		if err := monitor.DecodePolicyVerdictNotify(data, pvn); err != nil {
+			return fmt.Errorf("failed to parse policy verdict: %w", err)
 		}
 		eventSubType = pvn.SubType
 		packetOffset = monitor.PolicyVerdictNotifyLen
+		authType = pb.AuthType(pvn.GetAuthType())
 	case monitorAPI.MessageTypeCapture:
 		dbg = &monitor.DebugCapture{}
-		if err := binary.Read(bytes.NewReader(data), byteorder.Native, dbg); err != nil {
+		if err := monitor.DecodeDebugCapture(data, dbg); err != nil {
 			return fmt.Errorf("failed to parse debug capture: %w", err)
 		}
 		eventSubType = dbg.SubType
@@ -168,23 +170,34 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	}
 
 	ether, ip, l4, srcIP, dstIP, srcPort, dstPort, summary := decodeLayers(p.packet)
-	if tn != nil {
+	if tn != nil && ip != nil {
 		if !tn.OriginalIP().IsUnspecified() {
 			// Ignore invalid IP - getters will handle invalid value.
 			srcIP, _ = ippkg.AddrFromIP(tn.OriginalIP())
-			if ip != nil {
+			// On SNAT the trace notification has OrigIP set to the pre
+			// translation IP and the source IP parsed from the header is the
+			// post translation IP. The check is here because sometimes we get
+			// trace notifications with OrigIP set to the header's IP
+			// (pre-translation events?)
+			if ip.GetSource() != srcIP.String() {
+				ip.SourceXlated = ip.GetSource()
 				ip.Source = srcIP.String()
 			}
 		}
 
-		if ip != nil {
-			ip.Encrypted = (tn.Reason & monitor.TraceReasonEncryptMask) != 0
-		}
+		ip.Encrypted = tn.IsEncrypted()
 	}
 
 	srcLabelID, dstLabelID := decodeSecurityIdentities(dn, tn, pvn)
-	srcEndpoint := p.epResolver.ResolveEndpoint(srcIP, srcLabelID)
-	dstEndpoint := p.epResolver.ResolveEndpoint(dstIP, dstLabelID)
+	datapathContext := common.DatapathContext{
+		SrcIP:                 srcIP,
+		SrcLabelID:            srcLabelID,
+		DstIP:                 dstIP,
+		DstLabelID:            dstLabelID,
+		TraceObservationPoint: decoded.TraceObservationPoint,
+	}
+	srcEndpoint := p.epResolver.ResolveEndpoint(srcIP, srcLabelID, datapathContext)
+	dstEndpoint := p.epResolver.ResolveEndpoint(dstIP, dstLabelID, datapathContext)
 	var sourceService, destinationService *pb.Service
 	if p.serviceGetter != nil {
 		sourceService = p.serviceGetter.GetServiceByAddr(srcIP, srcPort)
@@ -192,6 +205,7 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	}
 
 	decoded.Verdict = decodeVerdict(dn, tn, pvn)
+	decoded.AuthType = authType
 	decoded.DropReason = decodeDropReason(dn, pvn)
 	decoded.DropReasonDesc = pb.DropReason(decoded.DropReason)
 	decoded.Ethernet = ether
@@ -207,6 +221,7 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	decoded.Reply = decoded.GetIsReply().GetValue() // false if GetIsReply() is nil
 	decoded.TrafficDirection = decodeTrafficDirection(srcEndpoint.ID, dn, tn, pvn)
 	decoded.EventType = decodeCiliumEventType(eventType, eventSubType)
+	decoded.TraceReason = decodeTraceReason(tn)
 	decoded.SourceService = sourceService
 	decoded.DestinationService = destinationService
 	decoded.PolicyMatchType = decodePolicyMatchType(pvn)
@@ -214,6 +229,10 @@ func (p *Parser) Decode(data []byte, decoded *pb.Flow) error {
 	decoded.Interface = p.decodeNetworkInterface(tn, dbg)
 	decoded.ProxyPort = decodeProxyPort(dbg, tn)
 	decoded.Summary = summary
+
+	if p.endpointGetter != nil {
+		correlation.CorrelatePolicy(p.endpointGetter, decoded)
+	}
 
 	return nil
 }
@@ -388,16 +407,15 @@ func decodeICMPv6(icmp *layers.ICMPv6) *pb.Layer4 {
 	}
 }
 
-func isReply(reason uint8) bool {
-	return reason & ^monitor.TraceReasonEncryptMask == monitor.TraceReasonCtReply
-}
-
 func decodeIsReply(tn *monitor.TraceNotify, pvn *monitor.PolicyVerdictNotify) *wrapperspb.BoolValue {
 	switch {
-	case tn != nil && monitor.TraceReasonIsKnown(tn.Reason):
+	case tn != nil && tn.TraceReasonIsKnown():
+		if tn.TraceReasonIsEncap() || tn.TraceReasonIsDecap() {
+			return nil
+		}
 		// Reason was specified by the datapath, just reuse it.
 		return &wrapperspb.BoolValue{
-			Value: isReply(tn.Reason),
+			Value: tn.TraceReasonIsReply(),
 		}
 	case pvn != nil && pvn.Verdict >= 0:
 		// Forwarded PolicyVerdictEvents are emitted for the first packet of
@@ -415,6 +433,29 @@ func decodeCiliumEventType(eventType, eventSubType uint8) *pb.CiliumEventType {
 	return &pb.CiliumEventType{
 		Type:    int32(eventType),
 		SubType: int32(eventSubType),
+	}
+}
+
+func decodeTraceReason(tn *monitor.TraceNotify) pb.TraceReason {
+	if tn == nil {
+		return pb.TraceReason_TRACE_REASON_UNKNOWN
+	}
+	// The Hubble protobuf enum values aren't 1:1 mapped with Cilium's datapath
+	// because we want pb.TraceReason_TRACE_REASON_UNKNOWN = 0 while in
+	// datapath monitor.TraceReasonUnknown = 5. The mapping works as follow:
+	switch {
+	// monitor.TraceReasonUnknown is mapped to pb.TraceReason_TRACE_REASON_UNKNOWN
+	case tn.TraceReason() == monitor.TraceReasonUnknown:
+		return pb.TraceReason_TRACE_REASON_UNKNOWN
+	// values before monitor.TraceReasonUnknown are "offset by one", e.g.
+	// TraceReasonCtEstablished = 1 → TraceReason_ESTABLISHED = 2 to make room
+	// for the zero value.
+	case tn.TraceReason() < monitor.TraceReasonUnknown:
+		return pb.TraceReason(tn.TraceReason()) + 1
+	// all values greater than monitor.TraceReasonUnknown are mapped 1:1 with
+	// the datapath values.
+	default:
+		return pb.TraceReason(tn.TraceReason())
 	}
 }
 
@@ -456,15 +497,27 @@ func decodeTrafficDirection(srcEP uint32, dn *monitor.DropNotify, tn *monitor.Tr
 		// tracking result from the `Reason` field to invert the direction for
 		// reply packets. The datapath currently populates the `Reason` field
 		// with CT information for some observation points.
-		if monitor.TraceReasonIsKnown(tn.Reason) {
+		if tn.TraceReasonIsKnown() {
 			// true if the traffic source is the local endpoint, i.e. egress
 			isSourceEP := tn.Source == uint16(srcEP)
+			// when OrigIP is set, then the packet was SNATed
+			isSNATed := !tn.OriginalIP().IsUnspecified()
 			// true if the packet is a reply, i.e. reverse direction
-			isReply := tn.Reason & ^monitor.TraceReasonEncryptMask == monitor.TraceReasonCtReply
+			isReply := tn.TraceReasonIsReply()
 
+			switch {
+			// Although technically the corresponding packet is ingressing the
+			// stack (TraceReasonEncryptOverlay traces are TraceToStack), it is
+			// ultimately originating from the local node and destinated to a
+			// remote node, so egress make more sense to expose at a high
+			// level.
+			case tn.TraceReason() == monitor.TraceReasonEncryptOverlay:
+				return pb.TrafficDirection_EGRESS
 			// isSourceEP != isReply ==
 			//  (isSourceEP && !isReply) || (!isSourceEP && isReply)
-			if isSourceEP != isReply {
+			case isSourceEP != isReply:
+				return pb.TrafficDirection_EGRESS
+			case isSNATed:
 				return pb.TrafficDirection_EGRESS
 			}
 			return pb.TrafficDirection_INGRESS

@@ -4,6 +4,10 @@ kind: Deployment
 metadata:
   name: hubble-relay
   namespace: {{ .Release.Namespace }}
+  {{- with .Values.hubble.relay.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   labels:
     k8s-app: hubble-relay
     app.kubernetes.io/name: hubble-relay
@@ -26,6 +30,10 @@ spec:
         {{- end }}
         {{- with .Values.hubble.relay.podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if and .Values.hubble.relay.prometheus.enabled (not .Values.hubble.relay.prometheus.serviceMonitor.enabled) }}
+        prometheus.io/port: {{ .Values.hubble.relay.prometheus.port | quote }}
+        prometheus.io/scrape: "true"
         {{- end }}
       labels:
         k8s-app: hubble-relay
@@ -60,18 +68,25 @@ spec:
           {{- end }}
           ports:
             - name: grpc
-              containerPort: {{ .Values.hubble.relay.listenPort }}
+              containerPort: {{ include "hubble-relay.config.listenPort" . }}
             {{- if .Values.hubble.relay.prometheus.enabled }}
             - name: prometheus
               containerPort: {{ .Values.hubble.relay.prometheus.port }}
               protocol: TCP
             {{- end }}
           readinessProbe:
-            tcpSocket:
-              port: grpc
+            grpc:
+              port: 4222
+            timeoutSeconds: 3
           livenessProbe:
-            tcpSocket:
-              port: grpc
+            grpc:
+              port: 4222
+            timeoutSeconds: 3
+          startupProbe:
+            grpc:
+              port: 4222
+            failureThreshold: 20
+            periodSeconds: 3
           {{- with .Values.hubble.relay.extraEnv }}
           env:
             {{- toYaml . | trim | nindent 12 }}
@@ -89,10 +104,13 @@ spec:
             mountPath: /var/lib/hubble-relay/tls
             readOnly: true
           {{- end }}
+          {{- with .Values.hubble.relay.extraVolumeMounts }}
+          {{- toYaml . | nindent 10 }}
+          {{- end }}
           terminationMessagePolicy: FallbackToLogsOnError
+        {{- include "hubble-relay.containers.extra" . | nindent 8 }}
       restartPolicy: Always
       priorityClassName: {{ .Values.hubble.relay.priorityClassName }}
-      serviceAccount: {{ .Values.serviceAccounts.relay.name | quote }}
       serviceAccountName: {{ .Values.serviceAccounts.relay.name | quote }}
       automountServiceAccountToken: {{ .Values.serviceAccounts.relay.automount }}
       terminationGracePeriodSeconds: {{ .Values.hubble.relay.terminationGracePeriodSeconds }}
@@ -143,7 +161,7 @@ spec:
                 - key: ca.crt
                   path: hubble-server-ca.crt
           {{- else }}
-          - configMap:
+          - {{ .Values.tls.caBundle.useSecret | ternary "secret" "configMap" }}:
               name: {{ .Values.tls.caBundle.name }}
               items:
                 - key: {{ .Values.tls.caBundle.key }}
@@ -159,4 +177,8 @@ spec:
                   path: server.key
           {{- end }}
       {{- end }}
+      {{- with .Values.hubble.relay.extraVolumes }}
+      {{- toYaml . | nindent 6}}
+      {{- end }}
+      {{- include "hubble-relay.volumes.extra" . | nindent 6 }}
 {{- end }}

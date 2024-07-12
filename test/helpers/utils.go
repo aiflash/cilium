@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,14 +21,10 @@ import (
 	. "github.com/onsi/gomega"
 	"golang.org/x/sys/unix"
 
-	"github.com/cilium/cilium/pkg/rand"
 	"github.com/cilium/cilium/pkg/versioncheck"
 	"github.com/cilium/cilium/test/config"
 	ginkgoext "github.com/cilium/cilium/test/ginkgo-ext"
 )
-
-// ensure that our random numbers are seeded differently on each run
-var randGen = rand.NewSafeRand(time.Now().UnixNano())
 
 // IsRunningOnJenkins detects if the currently running Ginkgo application is
 // most likely running in a Jenkins environment. Returns true if certain
@@ -67,7 +64,7 @@ func CountValues(key string, data []string) (int, int) {
 
 // MakeUID returns a randomly generated string.
 func MakeUID() string {
-	return fmt.Sprintf("%08x", randGen.Uint32())
+	return fmt.Sprintf("%08x", rand.Uint32())
 }
 
 // RenderTemplate renders a text/template string into a buffer.
@@ -111,7 +108,7 @@ func (c *TimeoutConfig) Validate() error {
 func WithTimeout(body func() bool, msg string, config *TimeoutConfig) error {
 	err := RepeatUntilTrue(body, config)
 	if err != nil {
-		return fmt.Errorf("%s: %s", msg, err)
+		return fmt.Errorf("%s: %w", msg, err)
 	}
 
 	return nil
@@ -154,10 +151,8 @@ func RepeatUntilTrue(body func() bool, config *TimeoutConfig) error {
 			}
 			// Provide some form of rate-limiting here before running next
 			// execution in case body() returns at a fast rate.
-			select {
-			case <-ticker.C:
-				go asyncBody(bodyChan)
-			}
+			<-ticker.C
+			go asyncBody(bodyChan)
 		case <-done:
 			return fmt.Errorf("%s timeout expired", config.Timeout)
 		}
@@ -416,8 +411,12 @@ func getK8sSupportedConstraints(ciliumVersion string) (semver.Range, error) {
 		return nil, err
 	}
 	switch {
+	case IsCiliumV1_16(cst):
+		return versioncheck.MustCompile(">=1.16.0 <1.31.0"), nil
+	case IsCiliumV1_15(cst):
+		return versioncheck.MustCompile(">=1.16.0 <1.30.0"), nil
 	case IsCiliumV1_14(cst):
-		return versioncheck.MustCompile(">=1.16.0 <1.27.0"), nil
+		return versioncheck.MustCompile(">=1.16.0 <1.28.0"), nil
 	case IsCiliumV1_13(cst):
 		return versioncheck.MustCompile(">=1.16.0 <1.27.0"), nil
 	case IsCiliumV1_12(cst):
@@ -465,7 +464,7 @@ func failIfContainsBadLogMsg(logs, label string, blacklist map[string][]string) 
 					}
 				}
 				if !ok {
-					count, _ := uniqueFailures[msg]
+					count := uniqueFailures[msg]
 					uniqueFailures[msg] = count + 1
 				}
 			}
@@ -509,29 +508,8 @@ func DoesNotRunOn54Kernel() bool {
 	return !RunsOn54Kernel()
 }
 
-// RunsOn419Kernel checks whether a test case is running on the 4.19 kernel.
-func RunsOn419Kernel() bool {
-	return os.Getenv("KERNEL") == "419"
-}
-
 func NativeRoutingCIDR() string {
 	return os.Getenv("NATIVE_CIDR")
-}
-
-// DoesNotRunOn419Kernel is the complement function of RunsOn419Kernel.
-func DoesNotRunOn419Kernel() bool {
-	return !RunsOn419Kernel()
-}
-
-// RunsOn419OrLaterKernel checks whether a test case is running on 4.19.x (x > 57) or later kernel
-func RunsOn419OrLaterKernel() bool {
-	return RunsOnNetNextKernel() || RunsOn419Kernel() || RunsOn54Kernel()
-}
-
-// DoesNotRunOn419OrLaterKernel is the complement function of
-// RunsOn419OrLaterKernel.
-func DoesNotRunOn419OrLaterKernel() bool {
-	return !RunsOn419OrLaterKernel()
 }
 
 // RunsOn54OrLaterKernel checks whether a test case is running on 5.4 or later kernel
@@ -633,7 +611,7 @@ func RunsOnJenkins() bool {
 // UDP host reachable services are enabled.
 func (kub *Kubectl) HasSocketLB(pod string) bool {
 	status := kub.CiliumExecContext(context.TODO(), pod,
-		"cilium status -o jsonpath='{.kube-proxy-replacement.features.socketLB}'")
+		"cilium-dbg status -o jsonpath='{.kube-proxy-replacement.features.socketLB}'")
 	status.ExpectSuccess("Failed to get status: %s", status.OutputPrettyPrint())
 	lines := status.ByLines()
 	Expect(len(lines)).ShouldNot(Equal(0), "Failed to get socketLB status")
@@ -644,7 +622,7 @@ func (kub *Kubectl) HasSocketLB(pod string) bool {
 // HasBPFNodePort returns true if the given Cilium pod has BPF NodePort enabled.
 func (kub *Kubectl) HasBPFNodePort(pod string) bool {
 	status := kub.CiliumExecContext(context.TODO(), pod,
-		"cilium status -o jsonpath='{.kube-proxy-replacement.features.nodePort.enabled}'")
+		"cilium-dbg status -o jsonpath='{.kube-proxy-replacement.features.nodePort.enabled}'")
 	status.ExpectSuccess("Failed to get status: %s", status.OutputPrettyPrint())
 	lines := status.ByLines()
 	Expect(len(lines)).ShouldNot(Equal(0), "Failed to get nodePort status")
@@ -792,4 +770,30 @@ func CiliumEndpointSliceFeatureEnabled() bool {
 	}
 	return k8sVersionGreaterEqual121(k8sVersion) && (GetCurrentIntegration() == "" ||
 		IsIntegration(CIIntegrationKind))
+}
+
+// SupportIPv6Connectivity returns true if the CI environment supports IPv6
+// connectivity across pods.
+func SupportIPv6Connectivity() bool {
+	supportedVersions := versioncheck.MustCompile(">=1.20.0")
+	k8sVersion, err := versioncheck.Version(GetCurrentK8SEnv())
+	if err != nil {
+		return false
+	}
+
+	if supportedVersions(k8sVersion) {
+		return true
+	}
+
+	if IsIntegration(CIIntegrationKind) {
+		return false
+	}
+
+	return true
+}
+
+// SupportIPv6ToOutside returns true if the CI environment supports IPv6
+// connectivity to the outside world.
+func SupportIPv6ToOutside() bool {
+	return os.Getenv("CILIUM_NO_IPV6_OUTSIDE") == ""
 }

@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 ARG COMPILERS_IMAGE=quay.io/cilium/image-compilers:5569a29cea6b3ad50aeb03102aaf3dc03841197c@sha256:b15dbedb7c49816c74a765e2f6ecdb9359763b8e4e4328d794f48b9cefae9804
-ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:b32efb0e682e74311b628df328dfd768108b92c2@sha256:0873607c0fc991c884bc7d39ea774c8ebd7df2be35f4b69b6d16b33ce871427b
+ARG CILIUM_RUNTIME_IMAGE=quay.io/cilium/cilium-runtime:c1d217bb9fa7bfdaa1fd277999f50fe562f7fae5@sha256:9501d73f44ba19b8d7033e4ba2c8ad19e46591f34697aef36918bc2c94acb824
 ARG TESTER_IMAGE=quay.io/cilium/image-tester:dd09c8d3ef349a909fbcdc99279516baef153f22@sha256:c056d064cb47c97acd607343db5457e1d49d9338d6d8a87e93e23cc93f052c73
-ARG GOLANG_IMAGE=docker.io/library/golang:1.20.3@sha256:403f48633fb5ebd49f9a2b6ad6719f912df23dae44974a0c9445be331e72ff5e
-ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:3408daa17f6490a464dfc746961e28ae31964c66@sha256:ff13a1a9f973d102c6ac907d2bc38a524c8e1d26c6c1b16ed809a98925206a79
+ARG GOLANG_IMAGE=docker.io/library/golang:1.22.5@sha256:fcae9e0e7313c6467a7c6632ebb5e5fab99bd39bd5eb6ee34a211353e647827a
+ARG CILIUM_LLVM_IMAGE=quay.io/cilium/cilium-llvm:9f1bfe736009afb1fbb562718bbc42ea07d37d8e@sha256:a666a7a01a2dc610c3ab6e32f25ca5e294201f3cbbc01f233320c527955deee3
 
 FROM ${COMPILERS_IMAGE} as compilers-image
 
@@ -60,6 +60,10 @@ RUN CGO_ENABLED=0 go install github.com/go-delve/delve/cmd/dlv@latest
 
 WORKDIR /go/src/github.com/cilium/cilium/images/builder
 RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/builder \
+    ./install-gitconfig.sh
+
+WORKDIR /go/src/github.com/cilium/cilium/images/builder
+RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/builder \
     --mount=type=cache,target=/root/.cache \
     --mount=type=cache,target=/go/pkg \
     ./build-debug-wrapper.sh
@@ -73,6 +77,11 @@ RUN --mount=type=bind,readwrite,target=/go/src/github.com/cilium/cilium/images/b
 
 # used to facilitate the verifier tests
 COPY --from=llvm-dist /usr/local/bin/llvm-objcopy /bin/
+
+# Create a cache directory with 777 so that we can run the builder image and
+# compile golang code from any UID.
+RUN mkdir -p /.cache && chmod 777 /.cache && \
+    mkdir -p /go/bin && chmod 777 /go/bin
 
 FROM ${TESTER_IMAGE} as test
 COPY --from=rootfs / /

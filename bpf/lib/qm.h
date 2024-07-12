@@ -1,14 +1,16 @@
 /* SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause) */
 /* Copyright Authors of Cilium */
 
-#ifndef __QM_H_
-#define __QM_H_
+#pragma once
 
 #include <bpf/ctx/ctx.h>
 
 static inline void reset_queue_mapping(struct __ctx_buff *ctx __maybe_unused)
 {
-#if defined(RESET_QUEUES) && __ctx_is == __ctx_skb
+#ifdef RESET_QUEUES
+	if (!ctx_is_skb())
+		return;
+
 	/* Workaround for GH-18311 where veth driver might have recorded
 	 * veth's RX queue mapping instead of leaving it at 0. This can
 	 * cause issues on the phys device where all traffic would only
@@ -20,5 +22,3 @@ static inline void reset_queue_mapping(struct __ctx_buff *ctx __maybe_unused)
 	ctx->queue_mapping = 0;
 #endif
 }
-
-#endif /* __QM_H_ */

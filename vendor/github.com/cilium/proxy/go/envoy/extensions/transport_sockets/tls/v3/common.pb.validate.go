@@ -82,6 +82,7 @@ func (m *TlsParameters) validate(all bool) error {
 	if len(errors) > 0 {
 		return TlsParametersMultiError(errors)
 	}
+
 	return nil
 }
 
@@ -189,9 +190,20 @@ func (m *PrivateKeyProvider) validate(all bool) error {
 		errors = append(errors, err)
 	}
 
-	switch m.ConfigType.(type) {
+	// no validation rules for Fallback
 
+	switch v := m.ConfigType.(type) {
 	case *PrivateKeyProvider_TypedConfig:
+		if v == nil {
+			err := PrivateKeyProviderValidationError{
+				field:  "ConfigType",
+				reason: "oneof value cannot be a typed-nil",
+			}
+			if !all {
+				return err
+			}
+			errors = append(errors, err)
+		}
 
 		if all {
 			switch v := interface{}(m.GetTypedConfig()).(type) {
@@ -222,11 +234,14 @@ func (m *PrivateKeyProvider) validate(all bool) error {
 			}
 		}
 
+	default:
+		_ = v // ensures v is used
 	}
 
 	if len(errors) > 0 {
 		return PrivateKeyProviderMultiError(errors)
 	}
+
 	return nil
 }
 
@@ -565,6 +580,7 @@ func (m *TlsCertificate) validate(all bool) error {
 	if len(errors) > 0 {
 		return TlsCertificateMultiError(errors)
 	}
+
 	return nil
 }
 
@@ -709,6 +725,7 @@ func (m *TlsSessionTicketKeys) validate(all bool) error {
 	if len(errors) > 0 {
 		return TlsSessionTicketKeysMultiError(errors)
 	}
+
 	return nil
 }
 
@@ -815,6 +832,7 @@ func (m *CertificateProviderPluginInstance) validate(all bool) error {
 	if len(errors) > 0 {
 		return CertificateProviderPluginInstanceMultiError(errors)
 	}
+
 	return nil
 }
 
@@ -918,7 +936,7 @@ func (m *SubjectAltNameMatcher) validate(all bool) error {
 	if _, ok := _SubjectAltNameMatcher_SanType_NotInLookup[m.GetSanType()]; ok {
 		err := SubjectAltNameMatcherValidationError{
 			field:  "SanType",
-			reason: "value must not be in list [0]",
+			reason: "value must not be in list [SAN_TYPE_UNSPECIFIED]",
 		}
 		if !all {
 			return err
@@ -980,6 +998,7 @@ func (m *SubjectAltNameMatcher) validate(all bool) error {
 	if len(errors) > 0 {
 		return SubjectAltNameMatcherMultiError(errors)
 	}
+
 	return nil
 }
 
@@ -1411,6 +1430,7 @@ func (m *CertificateValidationContext) validate(all bool) error {
 	if len(errors) > 0 {
 		return CertificateValidationContextMultiError(errors)
 	}
+
 	return nil
 }
 

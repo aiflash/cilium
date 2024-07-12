@@ -11,18 +11,15 @@ import (
 	"github.com/cilium/cilium/pkg/policy/api"
 )
 
-func FuzzMapSelectorsToIPsLocked(f *testing.F) {
+func FuzzMapSelectorsToNamesLocked(f *testing.F) {
 	f.Fuzz(func(t *testing.T, data []byte) {
 		ff := fuzz.NewConsumer(data)
-		fqdnSelectors := make(map[api.FQDNSelector]struct{})
-		ff.FuzzMap(&fqdnSelectors)
-		if len(fqdnSelectors) == 0 {
-			t.Skip()
-		}
+		fqdnSelector := api.FQDNSelector{}
+		ff.FuzzMap(fqdnSelector)
 		nameManager := NewNameManager(Config{
 			MinTTL: 1,
 			Cache:  NewDNSCache(0),
 		})
-		_, _ = nameManager.MapSelectorsToIPsLocked(fqdnSelectors)
+		nameManager.mapSelectorsToNamesLocked(fqdnSelector)
 	})
 }

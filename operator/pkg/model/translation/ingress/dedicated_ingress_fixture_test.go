@@ -11,7 +11,10 @@ import (
 	envoy_config_core_v3 "github.com/cilium/proxy/go/envoy/config/core/v3"
 	envoy_config_listener "github.com/cilium/proxy/go/envoy/config/listener/v3"
 	envoy_config_route_v3 "github.com/cilium/proxy/go/envoy/config/route/v3"
+	grpc_stats_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/http/grpc_stats/v3"
+	grpc_web_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/http/grpc_web/v3"
 	envoy_extensions_filters_http_router_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/http/router/v3"
+	envoy_extensions_listener_proxy_protocol_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/listener/proxy_protocol/v3"
 	envoy_extensions_listener_tls_inspector_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/listener/tls_inspector/v3"
 	http_connection_manager_v3 "github.com/cilium/proxy/go/envoy/extensions/filters/network/http_connection_manager/v3"
 	envoy_extensions_transport_sockets_tls_v3 "github.com/cilium/proxy/go/envoy/extensions/transport_sockets/tls/v3"
@@ -24,8 +27,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/cilium/cilium/operator/pkg/model"
-	"github.com/cilium/cilium/pkg/envoy"
 	ciliumv2 "github.com/cilium/cilium/pkg/k8s/apis/cilium.io/v2"
+	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
 )
 
 var socketOptions = []*envoy_config_core_v3.SocketOption{
@@ -36,7 +39,7 @@ var socketOptions = []*envoy_config_core_v3.SocketOption{
 		Value: &envoy_config_core_v3.SocketOption_IntValue{
 			IntValue: 1,
 		},
-		State: envoy_config_core_v3.SocketOption_STATE_LISTENING,
+		State: envoy_config_core_v3.SocketOption_STATE_PREBIND,
 	},
 	{
 		Description: "TCP keep-alive idle time (in seconds) (defaults to 10s)",
@@ -45,7 +48,7 @@ var socketOptions = []*envoy_config_core_v3.SocketOption{
 		Value: &envoy_config_core_v3.SocketOption_IntValue{
 			IntValue: 10,
 		},
-		State: envoy_config_core_v3.SocketOption_STATE_LISTENING,
+		State: envoy_config_core_v3.SocketOption_STATE_PREBIND,
 	},
 	{
 		Description: "TCP keep-alive probe intervals (in seconds) (defaults to 5s)",
@@ -54,7 +57,7 @@ var socketOptions = []*envoy_config_core_v3.SocketOption{
 		Value: &envoy_config_core_v3.SocketOption_IntValue{
 			IntValue: 5,
 		},
-		State: envoy_config_core_v3.SocketOption_STATE_LISTENING,
+		State: envoy_config_core_v3.SocketOption_STATE_PREBIND,
 	},
 	{
 		Description: "TCP keep-alive probe max failures.",
@@ -63,15 +66,21 @@ var socketOptions = []*envoy_config_core_v3.SocketOption{
 		Value: &envoy_config_core_v3.SocketOption_IntValue{
 			IntValue: 10,
 		},
-		State: envoy_config_core_v3.SocketOption_STATE_LISTENING,
+		State: envoy_config_core_v3.SocketOption_STATE_PREBIND,
 	},
 }
 
 func toEnvoyCluster(namespace, name, port string) *envoy_config_cluster_v3.Cluster {
 	return &envoy_config_cluster_v3.Cluster{
-		Name: fmt.Sprintf("%s/%s:%s", namespace, name, port),
+		Name: fmt.Sprintf("%s:%s:%s", namespace, name, port),
+		EdsClusterConfig: &envoy_config_cluster_v3.Cluster_EdsClusterConfig{
+			ServiceName: fmt.Sprintf("%s/%s:%s", namespace, name, port),
+		},
 		TypedExtensionProtocolOptions: map[string]*anypb.Any{
 			"envoy.extensions.upstreams.http.v3.HttpProtocolOptions": toAny(&envoy_upstreams_http_v3.HttpProtocolOptions{
+				CommonHttpProtocolOptions: &envoy_config_core_v3.HttpProtocolOptions{
+					IdleTimeout: &durationpb.Duration{Seconds: int64(60)},
+				},
 				UpstreamProtocolOptions: &envoy_upstreams_http_v3.HttpProtocolOptions_UseDownstreamProtocolConfig{
 					UseDownstreamProtocolConfig: &envoy_upstreams_http_v3.HttpProtocolOptions_UseDownstreamHttpConfig{
 						Http2ProtocolOptions: &envoy_config_core_v3.Http2ProtocolOptions{},
@@ -94,30 +103,7 @@ func toRouteAction(namespace, name, port string) *envoy_config_route_v3.Route_Ro
 	return &envoy_config_route_v3.Route_Route{
 		Route: &envoy_config_route_v3.RouteAction{
 			ClusterSpecifier: &envoy_config_route_v3.RouteAction_Cluster{
-				Cluster: fmt.Sprintf("%s/%s:%s", namespace, name, port),
-			},
-			MaxStreamDuration: &envoy_config_route_v3.RouteAction_MaxStreamDuration{
-				MaxStreamDuration: &durationpb.Duration{Seconds: 0},
-			},
-		},
-	}
-}
-
-func toWeightedClusterRouteAction(names []string) *envoy_config_route_v3.Route_Route {
-	weightedClusters := make([]*envoy_config_route_v3.WeightedCluster_ClusterWeight, 0, len(names))
-	for _, name := range names {
-		weightedClusters = append(weightedClusters, &envoy_config_route_v3.WeightedCluster_ClusterWeight{
-			Name:   name,
-			Weight: &wrapperspb.UInt32Value{Value: 1},
-		})
-	}
-
-	return &envoy_config_route_v3.Route_Route{
-		Route: &envoy_config_route_v3.RouteAction{
-			ClusterSpecifier: &envoy_config_route_v3.RouteAction_WeightedClusters{
-				WeightedClusters: &envoy_config_route_v3.WeightedCluster{
-					Clusters: weightedClusters,
-				},
+				Cluster: fmt.Sprintf("%s:%s:%s", namespace, name, port),
 			},
 			MaxStreamDuration: &envoy_config_route_v3.RouteAction_MaxStreamDuration{
 				MaxStreamDuration: &durationpb.Duration{Seconds: 0},
@@ -148,12 +134,34 @@ func toListenerFilter(name string) *envoy_config_listener.Filter {
 				UpgradeConfigs: []*http_connection_manager_v3.HttpConnectionManager_UpgradeConfig{
 					{UpgradeType: "websocket"},
 				},
+				UseRemoteAddress: &wrapperspb.BoolValue{Value: true},
+				SkipXffAppend:    false,
 				HttpFilters: []*http_connection_manager_v3.HttpFilter{
+					{
+						Name: "envoy.filters.http.grpc_web",
+						ConfigType: &http_connection_manager_v3.HttpFilter_TypedConfig{
+							TypedConfig: toAny(&grpc_web_v3.GrpcWeb{}),
+						},
+					},
+					{
+						Name: "envoy.filters.http.grpc_stats",
+						ConfigType: &http_connection_manager_v3.HttpFilter_TypedConfig{
+							TypedConfig: toAny(&grpc_stats_v3.FilterConfig{
+								EmitFilterState:     true,
+								EnableUpstreamStats: true,
+							}),
+						},
+					},
 					{
 						Name: "envoy.filters.http.router",
 						ConfigType: &http_connection_manager_v3.HttpFilter_TypedConfig{
 							TypedConfig: toAny(&envoy_extensions_filters_http_router_v3.Router{}),
 						},
+					},
+				},
+				CommonHttpProtocolOptions: &envoy_config_core_v3.HttpProtocolOptions{
+					MaxStreamDuration: &durationpb.Duration{
+						Seconds: 0,
 					},
 				},
 			}),
@@ -178,24 +186,6 @@ func toSecureListenerFilterChain(serverNames []string, certName string) *envoy_c
 						TlsCertificateSdsSecretConfigs: []*envoy_extensions_transport_sockets_tls_v3.SdsSecretConfig{
 							{
 								Name: certName,
-								SdsConfig: &envoy_config_core_v3.ConfigSource{
-									ConfigSourceSpecifier: &envoy_config_core_v3.ConfigSource_ApiConfigSource{
-										ApiConfigSource: &envoy_config_core_v3.ApiConfigSource{
-											ApiType:             envoy_config_core_v3.ApiConfigSource_GRPC,
-											TransportApiVersion: envoy_config_core_v3.ApiVersion_V3,
-											GrpcServices: []*envoy_config_core_v3.GrpcService{
-												{
-													TargetSpecifier: &envoy_config_core_v3.GrpcService_EnvoyGrpc_{
-														EnvoyGrpc: &envoy_config_core_v3.GrpcService_EnvoyGrpc{
-															ClusterName: envoy.CiliumXDSClusterName,
-														},
-													},
-												},
-											},
-										},
-									},
-									ResourceApiVersion: envoy_config_core_v3.ApiVersion_V3,
-								},
 							},
 						},
 					},
@@ -216,22 +206,48 @@ func toInsecureListenerFilterChain() *envoy_config_listener.FilterChain {
 	}
 }
 
-func toHTTPListenerXDSResource() *anypb.Any {
-	return toAny(&envoy_config_listener.Listener{
+func toHTTPListenerXDSResource(proxyProtocol bool, address *string, port *uint32) *anypb.Any {
+	listenerFilters := []*envoy_config_listener.ListenerFilter{
+		{
+			Name: "envoy.filters.listener.tls_inspector",
+			ConfigType: &envoy_config_listener.ListenerFilter_TypedConfig{
+				TypedConfig: toAny(&envoy_extensions_listener_tls_inspector_v3.TlsInspector{}),
+			},
+		},
+	}
+	if proxyProtocol {
+		proxyListener := &envoy_config_listener.ListenerFilter{
+			Name: "envoy.filters.listener.proxy_protocol",
+			ConfigType: &envoy_config_listener.ListenerFilter_TypedConfig{
+				TypedConfig: toAny(&envoy_extensions_listener_proxy_protocol_v3.ProxyProtocol{}),
+			},
+		}
+		listenerFilters = append([]*envoy_config_listener.ListenerFilter{proxyListener}, listenerFilters...)
+	}
+	l := &envoy_config_listener.Listener{
 		Name: "listener",
 		FilterChains: []*envoy_config_listener.FilterChain{
 			toInsecureListenerFilterChain(),
 		},
-		ListenerFilters: []*envoy_config_listener.ListenerFilter{
-			{
-				Name: "envoy.filters.listener.tls_inspector",
-				ConfigType: &envoy_config_listener.ListenerFilter_TypedConfig{
-					TypedConfig: toAny(&envoy_extensions_listener_tls_inspector_v3.TlsInspector{}),
+		ListenerFilters: listenerFilters,
+		SocketOptions:   socketOptions,
+	}
+
+	if address != nil && port != nil {
+		l.Address = &envoy_config_core_v3.Address{
+			Address: &envoy_config_core_v3.Address_SocketAddress{
+				SocketAddress: &envoy_config_core_v3.SocketAddress{
+					Protocol: envoy_config_core_v3.SocketAddress_TCP,
+					Address:  *address,
+					PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{
+						PortValue: *port,
+					},
 				},
 			},
-		},
-		SocketOptions: socketOptions,
-	})
+		}
+	}
+
+	return toAny(l)
 }
 
 func toBothListenersXDSResource(serverNames []string, certName string) *anypb.Any {
@@ -288,12 +304,8 @@ var defaultBackendListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 	ObjectMeta: metav1.ObjectMeta{
 		Name:      "cilium-ingress-random-namespace-load-balancing",
 		Namespace: "random-namespace",
-		OwnerReferences: []metav1.OwnerReference{
-			{
-				APIVersion: "networking.k8s.io/v1",
-				Kind:       "Ingress",
-				Name:       "load-balancing",
-			},
+		Labels: map[string]string{
+			"cilium.io/use-original-source-address": "false",
 		},
 	},
 	Spec: ciliumv2.CiliumEnvoyConfigSpec{
@@ -301,6 +313,9 @@ var defaultBackendListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-ingress-load-balancing",
 				Namespace: "random-namespace",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -311,7 +326,7 @@ var defaultBackendListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			},
 		},
 		Resources: []ciliumv2.XDSResource{
-			{Any: toHTTPListenerXDSResource()},
+			{Any: toHTTPListenerXDSResource(false, nil, nil)},
 			{
 				Any: toAny(&envoy_config_route_v3.RouteConfiguration{
 					Name: "listener-insecure",
@@ -338,7 +353,214 @@ var defaultBackendListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 	},
 }
 
-// Conformance/HostRules test
+// Conformance/HostRules test, enforce HTTPS is enabled
+var hostRulesListenersEnforceHTTPS = []model.HTTPListener{
+	{
+		Name: "ing-host-rules-random-namespace-*.foo.com",
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "host-rules",
+				Namespace: "random-namespace",
+				Version:   "networking.k8s.io/v1",
+				Kind:      "Ingress",
+			},
+		},
+		Port:     80,
+		Hostname: "*.foo.com",
+		Routes: []model.HTTPRoute{
+			{
+				PathMatch: model.StringMatch{
+					Prefix: "/",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "wildcard-foo-com",
+						Namespace: "random-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+			},
+		},
+	},
+	{
+		Name: "ing-host-rules-random-namespace-foo.bar.com",
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "host-rules",
+				Namespace: "random-namespace",
+				Version:   "networking.k8s.io/v1",
+				Kind:      "Ingress",
+			},
+		},
+		Port:     80,
+		Hostname: "foo.bar.com",
+		Routes: []model.HTTPRoute{
+			{
+				PathMatch: model.StringMatch{
+					Prefix: "/",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "foo-bar-com",
+						Namespace: "random-namespace",
+						Port: &model.BackendPort{
+							Name: "http",
+						},
+					},
+				},
+			},
+		},
+	},
+	{
+		Name: "ing-host-rules-random-namespace-foo.bar.com",
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "host-rules",
+				Namespace: "random-namespace",
+				Version:   "networking.k8s.io/v1",
+				Kind:      "Ingress",
+			},
+		},
+		Port:     443,
+		Hostname: "foo.bar.com",
+		TLS: []model.TLSSecret{
+			{
+				Name:      "conformance-tls",
+				Namespace: "random-namespace",
+			},
+		},
+		ForceHTTPtoHTTPSRedirect: true,
+		Routes: []model.HTTPRoute{
+			{
+				PathMatch: model.StringMatch{
+					Prefix: "/",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "foo-bar-com",
+						Namespace: "random-namespace",
+						Port: &model.BackendPort{
+							Name: "http",
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+var hostRulesListenersEnforceHTTPSCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "cilium-ingress-random-namespace-host-rules",
+		Namespace: "random-namespace",
+		Labels: map[string]string{
+			"cilium.io/use-original-source-address": "false",
+		},
+	},
+	Spec: ciliumv2.CiliumEnvoyConfigSpec{
+		Services: []*ciliumv2.ServiceListener{
+			{
+				Name:      "cilium-ingress-host-rules",
+				Namespace: "random-namespace",
+				Ports: []uint16{
+					80,
+					443,
+				},
+			},
+		},
+		BackendServices: []*ciliumv2.Service{
+			{
+				Name:      "foo-bar-com",
+				Namespace: "random-namespace",
+				Ports:     []string{"http"},
+			},
+			{
+				Name:      "wildcard-foo-com",
+				Namespace: "random-namespace",
+				Ports:     []string{"8080"},
+			},
+		},
+		Resources: []ciliumv2.XDSResource{
+			{Any: toBothListenersXDSResource([]string{"foo.bar.com"}, "cilium-secrets/random-namespace-conformance-tls")},
+			{
+				Any: toAny(&envoy_config_route_v3.RouteConfiguration{
+					Name: "listener-insecure",
+					VirtualHosts: []*envoy_config_route_v3.VirtualHost{
+						{
+							Name:    "*.foo.com",
+							Domains: []string{"*.foo.com", "*.foo.com:*"},
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match: &envoy_config_route_v3.RouteMatch{
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+											Prefix: "/",
+										},
+										Headers: []*envoy_config_route_v3.HeaderMatcher{
+											{
+												Name: ":authority",
+												HeaderMatchSpecifier: &envoy_config_route_v3.HeaderMatcher_StringMatch{
+													StringMatch: &envoy_type_matcher_v3.StringMatcher{
+														MatchPattern: &envoy_type_matcher_v3.StringMatcher_SafeRegex{
+															SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
+																Regex: "^[^.]+[.]foo[.]com$",
+															},
+														},
+													},
+												},
+											},
+										},
+										QueryParameters: []*envoy_config_route_v3.QueryParameterMatcher{},
+									},
+									Action: toRouteAction("random-namespace", "wildcard-foo-com", "8080"),
+								},
+							},
+						},
+						{
+							Name:    "foo.bar.com",
+							Domains: []string{"foo.bar.com", "foo.bar.com:*"},
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match: &envoy_config_route_v3.RouteMatch{
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+											Prefix: "/",
+										},
+									},
+									Action: toHTTPSRedirectAction(),
+								},
+							},
+						},
+					},
+				}),
+			},
+			{
+				Any: toAny(&envoy_config_route_v3.RouteConfiguration{
+					Name: "listener-secure",
+					VirtualHosts: []*envoy_config_route_v3.VirtualHost{
+						{
+							Name:    "foo.bar.com",
+							Domains: []string{"foo.bar.com", "foo.bar.com:*"},
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match: &envoy_config_route_v3.RouteMatch{
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+											Prefix: "/",
+										},
+									},
+									Action: toRouteAction("random-namespace", "foo-bar-com", "http"),
+								},
+							},
+						},
+					},
+				}),
+			},
+			{Any: toAny(toEnvoyCluster("random-namespace", "foo-bar-com", "http"))},
+			{Any: toAny(toEnvoyCluster("random-namespace", "wildcard-foo-com", "8080"))},
+		},
+	},
+}
+
 var hostRulesListeners = []model.HTTPListener{
 	{
 		Name: "ing-host-rules-random-namespace-*.foo.com",
@@ -439,12 +661,8 @@ var hostRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 	ObjectMeta: metav1.ObjectMeta{
 		Name:      "cilium-ingress-random-namespace-host-rules",
 		Namespace: "random-namespace",
-		OwnerReferences: []metav1.OwnerReference{
-			{
-				APIVersion: "networking.k8s.io/v1",
-				Kind:       "Ingress",
-				Name:       "host-rules",
-			},
+		Labels: map[string]string{
+			"cilium.io/use-original-source-address": "false",
 		},
 	},
 	Spec: ciliumv2.CiliumEnvoyConfigSpec{
@@ -452,6 +670,10 @@ var hostRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-ingress-host-rules",
 				Namespace: "random-namespace",
+				Ports: []uint16{
+					80,
+					443,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -473,31 +695,13 @@ var hostRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 					Name: "listener-insecure",
 					VirtualHosts: []*envoy_config_route_v3.VirtualHost{
 						{
-							Name:    "foo.bar.com",
-							Domains: []string{"foo.bar.com", "foo.bar.com:*"},
-							Routes: []*envoy_config_route_v3.Route{
-								{
-									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "(/.*)?$",
-											},
-										},
-									},
-									Action: toHTTPSRedirectAction(),
-								},
-							},
-						},
-						{
 							Name:    "*.foo.com",
 							Domains: []string{"*.foo.com", "*.foo.com:*"},
 							Routes: []*envoy_config_route_v3.Route{
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "(/.*)?$",
-											},
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+											Prefix: "/",
 										},
 										Headers: []*envoy_config_route_v3.HeaderMatcher{
 											{
@@ -519,6 +723,20 @@ var hostRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 								},
 							},
 						},
+						{
+							Name:    "foo.bar.com",
+							Domains: []string{"foo.bar.com", "foo.bar.com:*"},
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match: &envoy_config_route_v3.RouteMatch{
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+											Prefix: "/",
+										},
+									},
+									Action: toRouteAction("random-namespace", "foo-bar-com", "http"),
+								},
+							},
+						},
 					},
 				}),
 			},
@@ -532,16 +750,11 @@ var hostRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 							Routes: []*envoy_config_route_v3.Route{
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "(/.*)?$",
-											},
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+											Prefix: "/",
 										},
 									},
-									Action: toWeightedClusterRouteAction([]string{
-										"random-namespace/foo-bar-com:http",
-										"random-namespace/foo-bar-com:http",
-									}),
+									Action: toRouteAction("random-namespace", "foo-bar-com", "http"),
 								},
 							},
 						},
@@ -734,12 +947,8 @@ var pathRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 	ObjectMeta: metav1.ObjectMeta{
 		Name:      "cilium-ingress-random-namespace-path-rules",
 		Namespace: "random-namespace",
-		OwnerReferences: []metav1.OwnerReference{
-			{
-				APIVersion: "networking.k8s.io/v1",
-				Kind:       "Ingress",
-				Name:       "path-rules",
-			},
+		Labels: map[string]string{
+			"cilium.io/use-original-source-address": "false",
 		},
 	},
 	Spec: ciliumv2.CiliumEnvoyConfigSpec{
@@ -747,6 +956,9 @@ var pathRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			{
 				Name:      "cilium-ingress-path-rules",
 				Namespace: "random-namespace",
+				Ports: []uint16{
+					80,
+				},
 			},
 		},
 		BackendServices: []*ciliumv2.Service{
@@ -782,7 +994,7 @@ var pathRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 			},
 		},
 		Resources: []ciliumv2.XDSResource{
-			{Any: toHTTPListenerXDSResource()},
+			{Any: toHTTPListenerXDSResource(false, nil, nil)},
 			{
 				Any: toAny(&envoy_config_route_v3.RouteConfiguration{
 					Name: "listener-insecure",
@@ -815,10 +1027,8 @@ var pathRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 								},
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "/foo(/.*)?$",
-											},
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_PathSeparatedPrefix{
+											PathSeparatedPrefix: "/foo",
 										},
 									},
 									Action: toRouteAction("random-namespace", "foo-prefix", "8080"),
@@ -831,30 +1041,24 @@ var pathRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 							Routes: []*envoy_config_route_v3.Route{
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "/aaa/bbb(/.*)?$",
-											},
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_PathSeparatedPrefix{
+											PathSeparatedPrefix: "/aaa/bbb",
 										},
 									},
 									Action: toRouteAction("random-namespace", "aaa-slash-bbb-prefix", "8080"),
 								},
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "/foo(/.*)?$",
-											},
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_PathSeparatedPrefix{
+											PathSeparatedPrefix: "/foo",
 										},
 									},
 									Action: toRouteAction("random-namespace", "foo-prefix", "8080"),
 								},
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "/aaa(/.*)?$",
-											},
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_PathSeparatedPrefix{
+											PathSeparatedPrefix: "/aaa",
 										},
 									},
 									Action: toRouteAction("random-namespace", "aaa-prefix", "8080"),
@@ -875,10 +1079,8 @@ var pathRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 								},
 								{
 									Match: &envoy_config_route_v3.RouteMatch{
-										PathSpecifier: &envoy_config_route_v3.RouteMatch_SafeRegex{
-											SafeRegex: &envoy_type_matcher_v3.RegexMatcher{
-												Regex: "/aaa/bbb(/.*)?$",
-											},
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_PathSeparatedPrefix{
+											PathSeparatedPrefix: "/aaa/bbb",
 										},
 									},
 									Action: toRouteAction("random-namespace", "aaa-slash-bbb-slash-prefix", "8080"),
@@ -898,10 +1100,671 @@ var pathRulesListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
 	},
 }
 
+// Conformance/ProxyProtocol test
+var proxyProtocolListeners = []model.HTTPListener{
+	{
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "load-balancing",
+				Namespace: "random-namespace",
+				Version:   "networking.k8s.io/v1",
+				Kind:      "Ingress",
+			},
+		},
+		Port:     80,
+		Hostname: "*",
+		Routes: []model.HTTPRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "default-backend",
+						Namespace: "random-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
+func hostNetworkListeners(port uint32) []model.HTTPListener {
+	return []model.HTTPListener{
+		{
+			Sources: []model.FullyQualifiedResource{
+				{
+					Name:      "load-balancing",
+					Namespace: "random-namespace",
+					Version:   "networking.k8s.io/v1",
+					Kind:      "Ingress",
+				},
+			},
+			Port:     port,
+			Hostname: "*",
+			Routes: []model.HTTPRoute{
+				{
+					Backends: []model.Backend{
+						{
+							Name:      "default-backend",
+							Namespace: "random-namespace",
+							Port: &model.BackendPort{
+								Port: 8080,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+var proxyProtoListenersCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "cilium-ingress-random-namespace-load-balancing",
+		Namespace: "random-namespace",
+		Labels: map[string]string{
+			"cilium.io/use-original-source-address": "false",
+		},
+	},
+	Spec: ciliumv2.CiliumEnvoyConfigSpec{
+		Services: []*ciliumv2.ServiceListener{
+			{
+				Name:      "cilium-ingress-load-balancing",
+				Namespace: "random-namespace",
+				Ports: []uint16{
+					80,
+				},
+			},
+		},
+		BackendServices: []*ciliumv2.Service{
+			{
+				Name:      "default-backend",
+				Namespace: "random-namespace",
+				Ports:     []string{"8080"},
+			},
+		},
+		Resources: []ciliumv2.XDSResource{
+			{Any: toHTTPListenerXDSResource(true, nil, nil)},
+			{
+				Any: toAny(&envoy_config_route_v3.RouteConfiguration{
+					Name: "listener-insecure",
+					VirtualHosts: []*envoy_config_route_v3.VirtualHost{
+						{
+							Name:    "*",
+							Domains: []string{"*"},
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match: &envoy_config_route_v3.RouteMatch{
+										PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+											Prefix: "/",
+										},
+									},
+									Action: toRouteAction("random-namespace", "default-backend", "8080"),
+								},
+							},
+						},
+					},
+				}),
+			},
+			{Any: toAny(toEnvoyCluster("random-namespace", "default-backend", "8080"))},
+		},
+	},
+}
+
+func hostNetworkListenersCiliumEnvoyConfig(address string, port uint32, nodeLabelSelector *slim_metav1.LabelSelector) *ciliumv2.CiliumEnvoyConfig {
+	return &ciliumv2.CiliumEnvoyConfig{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cilium-ingress-random-namespace-load-balancing",
+			Namespace: "random-namespace",
+			Labels: map[string]string{
+				"cilium.io/use-original-source-address": "false",
+			},
+		},
+		Spec: ciliumv2.CiliumEnvoyConfigSpec{
+			NodeSelector: nodeLabelSelector,
+			Services: []*ciliumv2.ServiceListener{
+				{
+					Name:      "cilium-ingress-load-balancing",
+					Namespace: "random-namespace",
+					Ports: []uint16{
+						uint16(port),
+					},
+				},
+			},
+			BackendServices: []*ciliumv2.Service{
+				{
+					Name:      "default-backend",
+					Namespace: "random-namespace",
+					Ports:     []string{"8080"},
+				},
+			},
+			Resources: []ciliumv2.XDSResource{
+				{Any: toHTTPListenerXDSResource(false, model.AddressOf(address), model.AddressOf(port))},
+				{
+					Any: toAny(&envoy_config_route_v3.RouteConfiguration{
+						Name: "listener-insecure",
+						VirtualHosts: []*envoy_config_route_v3.VirtualHost{
+							{
+								Name:    "*",
+								Domains: []string{"*"},
+								Routes: []*envoy_config_route_v3.Route{
+									{
+										Match: &envoy_config_route_v3.RouteMatch{
+											PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+												Prefix: "/",
+											},
+										},
+										Action: toRouteAction("random-namespace", "default-backend", "8080"),
+									},
+								},
+							},
+						},
+					}),
+				},
+				{Any: toAny(toEnvoyCluster("random-namespace", "default-backend", "8080"))},
+			},
+		},
+	}
+}
+
 func toAny(message proto.Message) *anypb.Any {
 	a, err := anypb.New(message)
 	if err != nil {
 		return nil
 	}
 	return a
+}
+
+// default timeout for the ingress conformance tests
+var listenerDefaultTimeout = model.Timeout{
+	Request: nil,
+}
+
+func uint32p(in uint32) *uint32 {
+	return &in
+}
+
+var complexNodePortIngressListeners = []model.HTTPListener{
+	{
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "dummy-ingress",
+				Namespace: "dummy-namespace",
+				Version:   "v1",
+				Kind:      "Ingress",
+				UID:       "d4bd3dc3-2ac5-4ab4-9dca-89c62c60177e",
+			},
+		},
+		Port:     80,
+		Hostname: "*",
+		Routes: []model.HTTPRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "default-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Exact: "/dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Prefix: "/another-dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "another-dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8081,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+		},
+		Service: &model.Service{
+			Type:             "NodePort",
+			InsecureNodePort: uint32p(30000),
+			SecureNodePort:   uint32p(30001),
+		},
+	},
+	{
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "dummy-ingress",
+				Namespace: "dummy-namespace",
+				Version:   "v1",
+				Kind:      "Ingress",
+				UID:       "d4bd3dc3-2ac5-4ab4-9dca-89c62c60177e",
+			},
+		},
+		Port:     443,
+		Hostname: "another-very-secure.server.com",
+		TLS: []model.TLSSecret{
+			{
+				Name:      "tls-another-very-secure-server-com",
+				Namespace: "dummy-namespace",
+			},
+		},
+		Routes: []model.HTTPRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "default-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Exact: "/dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Prefix: "/another-dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "another-dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8081,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+		},
+		Service: &model.Service{
+			Type:             "NodePort",
+			InsecureNodePort: uint32p(30000),
+			SecureNodePort:   uint32p(30001),
+		},
+	},
+	{
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "dummy-ingress",
+				Namespace: "dummy-namespace",
+				Version:   "v1",
+				Kind:      "Ingress",
+				UID:       "d4bd3dc3-2ac5-4ab4-9dca-89c62c60177e",
+			},
+		},
+		Port:     443,
+		Hostname: "not-in-use.another-very-secure.server.com",
+		TLS: []model.TLSSecret{
+			{
+				Name:      "tls-another-very-secure-server-com",
+				Namespace: "dummy-namespace",
+			},
+		},
+		Routes: []model.HTTPRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "default-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Exact: "/dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Prefix: "/another-dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "another-dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8081,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+		},
+		Service: &model.Service{
+			Type:             "NodePort",
+			InsecureNodePort: uint32p(30000),
+			SecureNodePort:   uint32p(30001),
+		},
+	},
+	{
+		Sources: []model.FullyQualifiedResource{
+			{
+				Name:      "dummy-ingress",
+				Namespace: "dummy-namespace",
+				Version:   "v1",
+				Kind:      "Ingress",
+				UID:       "d4bd3dc3-2ac5-4ab4-9dca-89c62c60177e",
+			},
+		},
+		Port:     443,
+		Hostname: "very-secure.server.com",
+		TLS: []model.TLSSecret{
+			{
+				Name:      "tls-very-secure-server-com",
+				Namespace: "dummy-namespace",
+			},
+		},
+		Routes: []model.HTTPRoute{
+			{
+				Backends: []model.Backend{
+					{
+						Name:      "default-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Exact: "/dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8080,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+			{
+				PathMatch: model.StringMatch{
+					Prefix: "/another-dummy-path",
+				},
+				Backends: []model.Backend{
+					{
+						Name:      "another-dummy-backend",
+						Namespace: "dummy-namespace",
+						Port: &model.BackendPort{
+							Port: 8081,
+						},
+					},
+				},
+				Timeout: listenerDefaultTimeout,
+			},
+		},
+		Service: &model.Service{
+			Type:             "NodePort",
+			InsecureNodePort: uint32p(30000),
+			SecureNodePort:   uint32p(30001),
+		},
+	},
+}
+
+var complexNodePortIngressCiliumEnvoyConfig = &ciliumv2.CiliumEnvoyConfig{
+	ObjectMeta: metav1.ObjectMeta{
+		Name:      "cilium-ingress-dummy-namespace-dummy-ingress",
+		Namespace: "dummy-namespace",
+		Labels: map[string]string{
+			"cilium.io/use-original-source-address": "false",
+		},
+	},
+	Spec: ciliumv2.CiliumEnvoyConfigSpec{
+		NodeSelector: &slim_metav1.LabelSelector{MatchLabels: map[string]slim_metav1.MatchLabelsValue{"a": "b"}},
+		Services: []*ciliumv2.ServiceListener{
+			{
+				Name:      "cilium-ingress-dummy-ingress",
+				Namespace: "dummy-namespace",
+				Ports:     []uint16{80, 443},
+			},
+		},
+		BackendServices: []*ciliumv2.Service{
+			{
+				Name:      "another-dummy-backend",
+				Namespace: "dummy-namespace",
+				Ports:     []string{"8081"},
+			},
+			{
+				Name:      "default-backend",
+				Namespace: "dummy-namespace",
+				Ports:     []string{"8080"},
+			},
+			{
+				Name:      "dummy-backend",
+				Namespace: "dummy-namespace",
+				Ports:     []string{"8080"},
+			},
+		},
+		Resources: []ciliumv2.XDSResource{
+			{Any: toAny(
+				&envoy_config_listener.Listener{
+					Name: "listener",
+					FilterChains: []*envoy_config_listener.FilterChain{
+						toInsecureListenerFilterChain(),
+						toSecureListenerFilterChain([]string{"another-very-secure.server.com", "not-in-use.another-very-secure.server.com"}, "cilium-secrets/dummy-namespace-tls-another-very-secure-server-com"),
+						toSecureListenerFilterChain([]string{"very-secure.server.com"}, "cilium-secrets/dummy-namespace-tls-very-secure-server-com"),
+					},
+					AdditionalAddresses: []*envoy_config_listener.AdditionalAddress{
+						{
+							Address: &envoy_config_core_v3.Address{
+								Address: &envoy_config_core_v3.Address_SocketAddress{
+									SocketAddress: &envoy_config_core_v3.SocketAddress{
+										Address: "0.0.0.0",
+										PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{
+											PortValue: 443,
+										},
+									},
+								},
+							},
+						},
+					},
+					Address: &envoy_config_core_v3.Address{
+						Address: &envoy_config_core_v3.Address_SocketAddress{
+							SocketAddress: &envoy_config_core_v3.SocketAddress{
+								Address: "0.0.0.0",
+								PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{
+									PortValue: 80,
+								},
+							},
+						},
+					},
+					ListenerFilters: []*envoy_config_listener.ListenerFilter{
+						{
+							Name: "envoy.filters.listener.tls_inspector",
+							ConfigType: &envoy_config_listener.ListenerFilter_TypedConfig{
+								TypedConfig: toAny(&envoy_extensions_listener_tls_inspector_v3.TlsInspector{}),
+							},
+						},
+					},
+					SocketOptions: socketOptions,
+				})},
+			{
+				Any: toAny(&envoy_config_route_v3.RouteConfiguration{
+					Name: "listener-insecure",
+					VirtualHosts: []*envoy_config_route_v3.VirtualHost{
+						{
+							Name:    "*",
+							Domains: domainsHelper("*"),
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match:  envoyRouteMatchExactPath("/dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "dummy-backend", "8080"),
+								},
+								{
+									Match:  envoyRouteMatchPrefixPath("/another-dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "another-dummy-backend", "8081"),
+								},
+								{
+									Match:  envoyRouteMatchRootPath(),
+									Action: envoyRouteAction("dummy-namespace", "default-backend", "8080"),
+								},
+							},
+						},
+					},
+				}),
+			},
+			{
+				Any: toAny(&envoy_config_route_v3.RouteConfiguration{
+					Name: "listener-secure",
+					VirtualHosts: []*envoy_config_route_v3.VirtualHost{
+						{
+							Name:    "another-very-secure.server.com",
+							Domains: domainsHelper("another-very-secure.server.com"),
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match:  envoyRouteMatchExactPath("/dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "dummy-backend", "8080"),
+								},
+								{
+									Match:  envoyRouteMatchPrefixPath("/another-dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "another-dummy-backend", "8081"),
+								},
+								{
+									Match:  envoyRouteMatchRootPath(),
+									Action: envoyRouteAction("dummy-namespace", "default-backend", "8080"),
+								},
+							},
+						},
+						{
+							Name:    "not-in-use.another-very-secure.server.com",
+							Domains: domainsHelper("not-in-use.another-very-secure.server.com"),
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match:  envoyRouteMatchExactPath("/dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "dummy-backend", "8080"),
+								},
+								{
+									Match:  envoyRouteMatchPrefixPath("/another-dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "another-dummy-backend", "8081"),
+								},
+								{
+									Match:  envoyRouteMatchRootPath(),
+									Action: envoyRouteAction("dummy-namespace", "default-backend", "8080"),
+								},
+							},
+						},
+						{
+							Name:    "very-secure.server.com",
+							Domains: domainsHelper("very-secure.server.com"),
+							Routes: []*envoy_config_route_v3.Route{
+								{
+									Match:  envoyRouteMatchExactPath("/dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "dummy-backend", "8080"),
+								},
+								{
+									Match:  envoyRouteMatchPrefixPath("/another-dummy-path"),
+									Action: envoyRouteAction("dummy-namespace", "another-dummy-backend", "8081"),
+								},
+								{
+									Match:  envoyRouteMatchRootPath(),
+									Action: envoyRouteAction("dummy-namespace", "default-backend", "8080"),
+								},
+							},
+						},
+					},
+				}),
+			},
+			{Any: toAny(toEnvoyCluster("dummy-namespace", "another-dummy-backend", "8081"))},
+			{Any: toAny(toEnvoyCluster("dummy-namespace", "default-backend", "8080"))},
+			{Any: toAny(toEnvoyCluster("dummy-namespace", "dummy-backend", "8080"))},
+		},
+	},
+}
+
+func domainsHelper(domain string) []string {
+	if domain == "*" {
+		return []string{domain}
+	}
+
+	return []string{domain, fmt.Sprintf("%s:*", domain)}
+}
+
+func envoyRouteMatchExactPath(path string) *envoy_config_route_v3.RouteMatch {
+	return &envoy_config_route_v3.RouteMatch{
+		PathSpecifier: &envoy_config_route_v3.RouteMatch_Path{
+			Path: path,
+		},
+	}
+}
+
+func envoyRouteMatchRootPath() *envoy_config_route_v3.RouteMatch {
+	return &envoy_config_route_v3.RouteMatch{
+		PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+			Prefix: "/",
+		},
+	}
+}
+
+func envoyRouteMatchPrefixPath(path string) *envoy_config_route_v3.RouteMatch {
+	return &envoy_config_route_v3.RouteMatch{
+		PathSpecifier: &envoy_config_route_v3.RouteMatch_PathSeparatedPrefix{
+			PathSeparatedPrefix: path,
+		},
+	}
+}
+
+func envoyRouteAction(namespace, backend, port string) *envoy_config_route_v3.Route_Route {
+	return &envoy_config_route_v3.Route_Route{
+		Route: &envoy_config_route_v3.RouteAction{
+			ClusterSpecifier: &envoy_config_route_v3.RouteAction_Cluster{
+				Cluster: fmt.Sprintf("%s:%s:%s", namespace, backend, port),
+			},
+			MaxStreamDuration: &envoy_config_route_v3.RouteAction_MaxStreamDuration{
+				MaxStreamDuration: &durationpb.Duration{Seconds: 0},
+			},
+		},
+	}
 }

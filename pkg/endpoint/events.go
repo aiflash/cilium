@@ -4,15 +4,17 @@
 package endpoint
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strconv"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/cilium/cilium/pkg/bandwidth"
+	"github.com/cilium/cilium/pkg/datapath/linux/bandwidth"
+	datapath "github.com/cilium/cilium/pkg/datapath/types"
 	"github.com/cilium/cilium/pkg/eventqueue"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/maps/bwmap"
 	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/policy"
 )
@@ -44,7 +46,9 @@ func (ev *EndpointRegenerationEvent) Handle(res chan interface{}) {
 	// being deleted at the same time. More info PR-1777.
 	doneFunc, err := e.owner.QueueEndpointBuild(regenContext.parentContext, uint64(e.ID))
 	if err != nil {
-		e.getLogger().WithError(err).Warning("unable to queue endpoint build")
+		if !errors.Is(err, context.Canceled) {
+			e.getLogger().WithError(err).Warning("unable to queue endpoint build")
+		}
 	} else if doneFunc != nil {
 		e.getLogger().Debug("Dequeued endpoint from build queue")
 
@@ -65,7 +69,6 @@ func (ev *EndpointRegenerationEvent) Handle(res chan interface{}) {
 	res <- &EndpointRegenerationResult{
 		err: err,
 	}
-	return
 }
 
 // EndpointRegenerationResult contains the results of an endpoint regeneration.
@@ -158,22 +161,18 @@ func (ev *EndpointNoTrackEvent) Handle(res chan interface{}) {
 		log.Debug("Updating NOTRACK rules")
 		if e.IPv4.IsValid() {
 			if port > 0 {
-				err = e.owner.Datapath().InstallNoTrackRules(e.IPv4.String(), port, false)
-				log.WithError(err).Warn("Error installing iptable NOTRACK rules")
+				e.owner.Datapath().InstallNoTrackRules(e.IPv4, port)
 			}
 			if e.noTrackPort > 0 {
-				err = e.owner.Datapath().RemoveNoTrackRules(e.IPv4.String(), e.noTrackPort, false)
-				log.WithError(err).Warn("Error removing iptable NOTRACK rules")
+				e.owner.Datapath().RemoveNoTrackRules(e.IPv4, e.noTrackPort)
 			}
 		}
 		if e.IPv6.IsValid() {
 			if port > 0 {
-				e.owner.Datapath().InstallNoTrackRules(e.IPv6.String(), port, true)
-				log.WithError(err).Warn("Error installing iptable NOTRACK rules")
+				e.owner.Datapath().InstallNoTrackRules(e.IPv6, port)
 			}
 			if e.noTrackPort > 0 {
-				err = e.owner.Datapath().RemoveNoTrackRules(e.IPv6.String(), e.noTrackPort, true)
-				log.WithError(err).Warn("Error removing iptable NOTRACK rules")
+				e.owner.Datapath().RemoveNoTrackRules(e.IPv6, e.noTrackPort)
 			}
 		}
 		e.noTrackPort = port
@@ -182,7 +181,6 @@ func (ev *EndpointNoTrackEvent) Handle(res chan interface{}) {
 	res <- &EndpointRegenerationResult{
 		err: nil,
 	}
-	return
 }
 
 // EndpointPolicyVisibilityEvent contains all fields necessary to update the
@@ -228,8 +226,17 @@ func (ev *EndpointPolicyVisibilityEvent) Handle(res chan interface{}) {
 		return
 	}
 	if proxyVisibility != "" {
+		if e.IsProxyDisabled() {
+			e.getLogger().
+				WithField(logfields.EndpointID, e.GetID()).
+				Warn("ignoring L7 proxy visibility policy as L7 proxy is disabled")
+			res <- &EndpointRegenerationResult{
+				err: nil,
+			}
+			return
+		}
 		e.getLogger().Debug("creating visibility policy")
-		nvp, err = policy.NewVisibilityPolicy(proxyVisibility)
+		nvp, err = policy.NewVisibilityPolicy(proxyVisibility, e.K8sNamespace, e.K8sPodName)
 		if err != nil {
 			e.getLogger().WithError(err).Warning("unable to parse annotations into visibility policy; disabling visibility policy for endpoint")
 			e.visibilityPolicy = &policy.VisibilityPolicy{
@@ -248,12 +255,12 @@ func (ev *EndpointPolicyVisibilityEvent) Handle(res chan interface{}) {
 	res <- &EndpointRegenerationResult{
 		err: nil,
 	}
-	return
 }
 
 // EndpointPolicyBandwidthEvent contains all fields necessary to update
 // the Pod's bandwidth policy.
 type EndpointPolicyBandwidthEvent struct {
+	bwm    datapath.BandwidthManager
 	ep     *Endpoint
 	annoCB AnnotationsResolverCB
 }
@@ -261,6 +268,13 @@ type EndpointPolicyBandwidthEvent struct {
 // Handle handles the policy bandwidth update.
 func (ev *EndpointPolicyBandwidthEvent) Handle(res chan interface{}) {
 	var bps uint64
+
+	if !ev.bwm.Enabled() {
+		res <- &EndpointRegenerationResult{
+			err: nil,
+		}
+		return
+	}
 
 	e := ev.ep
 	if err := e.lockAlive(); err != nil {
@@ -276,7 +290,7 @@ func (ev *EndpointPolicyBandwidthEvent) Handle(res chan interface{}) {
 	}()
 
 	bandwidthEgress, err := ev.annoCB(e.K8sNamespace, e.K8sPodName)
-	if err != nil || !option.Config.EnableBandwidthManager {
+	if err != nil {
 		res <- &EndpointRegenerationResult{
 			err: err,
 		}
@@ -285,10 +299,12 @@ func (ev *EndpointPolicyBandwidthEvent) Handle(res chan interface{}) {
 	if bandwidthEgress != "" {
 		bps, err = bandwidth.GetBytesPerSec(bandwidthEgress)
 		if err == nil {
-			err = bwmap.Update(e.ID, bps)
+			ev.bwm.UpdateBandwidthLimit(e.ID, bps)
+		} else {
+			e.getLogger().WithError(err).Debugf("failed to parse bandwidth limit %q", bandwidthEgress)
 		}
 	} else {
-		err = bwmap.SilentDelete(e.ID)
+		ev.bwm.DeleteBandwidthLimit(e.ID)
 	}
 	if err != nil {
 		res <- &EndpointRegenerationResult{

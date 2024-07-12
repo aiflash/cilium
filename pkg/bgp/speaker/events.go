@@ -88,7 +88,7 @@ type nodeEvent struct {
 // loop is only stopped (implicitly) when the Agent is shutting down.
 //
 // Adapted from go.universe.tf/metallb/pkg/k8s/k8s.go.
-func (s *MetalLBSpeaker) run(ctx context.Context) {
+func (s *metallbspeaker) run(ctx context.Context) {
 	l := log.WithFields(
 		logrus.Fields{
 			"component": "MetalLBSpeaker.run",
@@ -103,7 +103,7 @@ func (s *MetalLBSpeaker) run(ctx context.Context) {
 		// previous to this iteration, we processed an event
 		// which indicates the speaker should yield. shut
 		// it down.
-		if s.shutdown > 0 { // atomic load not necessary, we are the only writer.
+		if s.shutdown.Load() {
 			l.Info("speaker shutting down.")
 			return
 		}
@@ -132,7 +132,7 @@ func (s *MetalLBSpeaker) run(ctx context.Context) {
 // do performs the appropriate action depending on the event type. For example,
 // if it is a service event (svcEvent), then it will call into MetalLB's
 // SetService() to perform BGP announcements.
-func (s *MetalLBSpeaker) do(key interface{}) types.SyncState {
+func (s *metallbspeaker) do(key interface{}) types.SyncState {
 	l := log.WithFields(
 		logrus.Fields{
 			"component": "MetalLBSpeaker.do",
@@ -193,14 +193,12 @@ func (s *MetalLBSpeaker) do(key interface{}) types.SyncState {
 	}
 }
 
-func (s *MetalLBSpeaker) handleNodeEvent(k nodeEvent) types.SyncState {
-	var (
-		l = log.WithFields(logrus.Fields{
-			"component": "MetalLBSpeaker.handleNodeEvent",
-			"labels":    k.labels,
-			"cidrs":     k.podCIDRs,
-		})
-	)
+func (s *metallbspeaker) handleNodeEvent(k nodeEvent) types.SyncState {
+	l := log.WithFields(logrus.Fields{
+		"component": "MetalLBSpeaker.handleNodeEvent",
+		"labels":    k.labels,
+		"cidrs":     k.podCIDRs,
+	})
 
 	if k.withDraw {
 		// this is a best effort method call, so we don't

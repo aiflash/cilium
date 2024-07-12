@@ -12,28 +12,9 @@ import (
 	"time"
 
 	consulAPI "github.com/hashicorp/consul/api"
-	. "gopkg.in/check.v1"
 
 	"github.com/cilium/cilium/pkg/testutils"
 )
-
-type ConsulSuite struct {
-	BaseTests
-}
-
-var _ = Suite(&ConsulSuite{})
-
-func (e *ConsulSuite) SetUpSuite(c *C) {
-	testutils.IntegrationCheck(c)
-}
-
-func (e *ConsulSuite) SetUpTest(c *C) {
-	SetupDummy("consul")
-}
-
-func (e *ConsulSuite) TearDownTest(c *C) {
-	Client().Close(context.TODO())
-}
 
 var handler http.HandlerFunc
 
@@ -73,7 +54,7 @@ func TestConsulClientOk(t *testing.T) {
 	maxRetries = 3
 	doneC := make(chan struct{})
 
-	handler = func(w http.ResponseWriter, r *http.Request) {
+	handler = func(w http.ResponseWriter, _ *http.Request) {
 		io.WriteString(w, "\"nanananananananananleaaderrrr\"")
 		close(doneC)
 	}

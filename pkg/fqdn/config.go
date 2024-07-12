@@ -5,12 +5,8 @@ package fqdn
 
 import (
 	"context"
-	"net"
-	"net/netip"
-	"sync"
 
-	"github.com/cilium/cilium/pkg/identity"
-	"github.com/cilium/cilium/pkg/policy/api"
+	"github.com/cilium/cilium/pkg/ipcache"
 )
 
 // Config is a simple configuration structure to set how pkg/fqdn subcomponents
@@ -23,7 +19,24 @@ type Config struct {
 	// When set to nil, it uses fqdn.DefaultDNSCache, a global cache instance.
 	Cache *DNSCache
 
-	// UpdateSelectors is a callback to update the mapping of FQDNSelector to
-	// sets of IPs.
-	UpdateSelectors func(ctx context.Context, selectorsWithIPs map[api.FQDNSelector][]net.IP, selectorsWithoutIPs []api.FQDNSelector) (*sync.WaitGroup, []*identity.Identity, map[netip.Prefix]*identity.Identity, error)
+	// GetEndpointsDNSInfo is a function that returns a list of fqdn-relevant fields from all Endpoints known to the agent.
+	// The endpoint's DNSHistory and DNSZombies are used as part of the garbage collection and restoration processes.
+	//
+	// Optional parameter endpointID will cause this function to only return the endpoint with the specified ID.
+	GetEndpointsDNSInfo func(endpointID string) []EndpointDNSInfo
+
+	IPCache IPCache
+}
+
+type EndpointDNSInfo struct {
+	ID         string
+	ID64       int64
+	DNSHistory *DNSCache
+	DNSZombies *DNSZombieMappings
+}
+
+type IPCache interface {
+	UpsertMetadataBatch(updates ...ipcache.MU) (revision uint64)
+	RemoveMetadataBatch(updates ...ipcache.MU) (revision uint64)
+	WaitForRevision(ctx context.Context, rev uint64) error
 }
